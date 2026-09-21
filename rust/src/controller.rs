@@ -91,3 +91,25 @@ pub fn apply_desired_state(dev: &G502Device, cfg: &Config) -> Result<AppliedStat
         Ok(AppliedState { mode, dpi })
     })
 }
+
+/// 把配置中的分区灯效重放到刚上线/唤醒的设备(仅首次连接调用)。
+/// 逐分区尽力而为:单个分区失败(如旧配置含已不支持的效果)不影响其它分区。
+pub fn apply_desired_led(dev: &G502Device, cfg: &Config) {
+    let Ok(led) = crate::features::led::Led::new(dev) else {
+        return;
+    };
+    for (key, spec) in &cfg.led_zones {
+        let Some(zone) = crate::features::led::zone_from_key(key) else {
+            continue;
+        };
+        let r = if spec.off {
+            led.set_off(zone)
+        } else {
+            let period = crate::features::led::rate_period_ms(spec.rate.as_deref()).unwrap_or(0);
+            led.set_effect(zone, &spec.effect, spec.rgb, spec.brightness, period)
+        };
+        if let Err(e) = r {
+            eprintln!("恢复分区 {key} 灯效失败: {e}");
+        }
+    }
+}

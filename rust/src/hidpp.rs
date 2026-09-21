@@ -93,6 +93,7 @@ pub struct Transport {
 pub struct InterfaceInfo {
     pub path: CString,
     pub pid: u16,
+    #[allow(dead_code)]
     pub usage_page: u16,
     pub product: String,
 }

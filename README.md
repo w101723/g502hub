@@ -10,8 +10,8 @@ G502 LIGHTSPEED 的轻量管理工具,替代臃肿的 Logitech G HUB。
 |---|---|---|
 | 电量/充电状态 | 原生 macOS 单色圆环按周长表示百分比；放电时圆心留空，充电时显示闪电，离线时显示斜杠 | 无需 |
 | DPI 设置 | 菜单快切 / CLI 设置(100–25600,步进 50),睡眠唤醒后自动恢复 | 无需 |
-| RGB 灯效 | 固定色/呼吸/循环/关闭 | 无需 |
-| 配置档 Profile | 多组 DPI+灯效一键切换 | 无需 |
+| RGB 灯效 | 主要/标志分区独立设置:固定色/呼吸/循环/关闭,支持速率与亮度;重连自动恢复 | 无需 |
+| 配置档 Profile | 多组 DPI+灯效一键切换(默认无配置档,可在 config.json 自行添加) | 无需 |
 | 侧键宏 | 拦截 G4/G5 等主机可见侧键,回放任意键序/文本 | 需辅助功能(授权列表里显示为 g502hub) |
 
 连接方式自动适配:LIGHTSPEED 接收器(0xC539)与 USB 有线直连。USB 接口每 2 秒进行一次无设备通信的存在检查，拔出后快速显示离线；重新插入后自动恢复连接、Host 模式和期望 DPI。
@@ -25,9 +25,12 @@ rust/target/release/g502hub status                 # 设备/电量/DPI 总览
 rust/target/release/g502hub battery [--json]
 rust/target/release/g502hub dpi get|list
 rust/target/release/g502hub dpi set 1600 [--save]
-rust/target/release/g502hub led set --color FF8800 --brightness 80
-rust/target/release/g502hub led set --off
-rust/target/release/g502hub profile list|apply 游戏
+rust/target/release/g502hub led get                            # 两分区当前配置
+rust/target/release/g502hub led set --zone primary --effect solid --color FF8800 --brightness 80
+rust/target/release/g502hub led set --zone logo --effect breathing --color 00C8FF --rate fast
+rust/target/release/g502hub led set --zone all --effect cycle --rate slow
+rust/target/release/g502hub led set --off                      # 关闭两分区
+rust/target/release/g502hub profile list|apply 名称
 rust/target/release/g502hub macro list|test mouse3
 rust/target/release/g502hub monitor --interval 120
 rust/target/release/g502hub probe all              # 只读协议探测
@@ -45,9 +48,9 @@ rust/target/release/g502hub menubar
   "desired_mode": "host",
   "desired_dpi": 3200,
   "dpi_levels": [400, 800, 1600, 3200],
-  "profiles": {
-    "办公": {"dpi_levels": [800, 1200], "active_dpi": 1200, "led": null},
-    "游戏": {"dpi_levels": [400, 800, 1600, 3200], "active_dpi": 3200, "led": {"effect": "off"}}
+  "led_zones": {
+    "primary": {"effect": "breathing", "rgb": [255, 0, 0], "brightness": 100, "rate": "medium"},
+    "logo": {"effect": "solid", "rgb": [255, 255, 255], "brightness": 100, "rate": "fast"}
   },
   "macros": {
     "mouse3": {
@@ -102,6 +105,11 @@ cd rust && cargo build --release
 - Feature 发现:Root(0x0000) GetFeature;电池 0x1001(电压→百分比曲线);DPI 0x2201
   (f1 列表含 0b111 前缀的范围压缩条目);灯效 0x8070;板载模式 0x8100 f2
 - 未匹配的响应/异步包在 `hidpp.rs` 的 `wait_response` 中过滤
+- 灯效 0x8070 真机校准:两个分区各固定 4 个效果槽位(f2 按槽位枚举):
+  0=off、1=solid、2=cycle(0x0003)、3=breathing(0x000A)。f3 SetZoneEffect
+  的 16 字节 payload 按槽位解释——solid 为 `[zone,1,R,G,B,亮度]`(正序 RGB,
+  不能带效果 id 字节);cycle/breathing 的参数区以 2 字节效果 id 开头,
+  周期为毫秒大端。f14 读回恒为 0,不可用作写入确认。
 - 协议探测:`g502hub probe all`(只读,不发送 SET)
 
 ## 已知限制

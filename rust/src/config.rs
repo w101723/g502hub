@@ -15,6 +15,21 @@ pub struct LedSpec {
     pub rgb: [u8; 3],
     #[serde(default = "default_brightness")]
     pub brightness: u8,
+    /// 灯效速率:slow/medium/fast;None 表示使用设备默认节奏。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<String>,
+}
+
+impl LedSpec {
+    pub fn new(effect: &str, rgb: [u8; 3], brightness: u8, rate: Option<&str>) -> Self {
+        LedSpec {
+            off: effect == "off",
+            effect: effect.into(),
+            rgb,
+            brightness,
+            rate: rate.map(|r| r.into()),
+        }
+    }
 }
 
 fn default_effect() -> String {
@@ -96,6 +111,9 @@ pub struct Config {
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     pub macros: BTreeMap<String, MacroBinding>,
+    /// 分区灯效配置:键 primary(主要) / logo(标志)。
+    #[serde(default)]
+    pub led_zones: BTreeMap<String, LedSpec>,
     #[serde(default = "default_poll")]
     pub battery_poll_seconds: u64,
     #[serde(default = "default_threshold")]
@@ -130,29 +148,14 @@ impl Default for Config {
                 }],
             },
         );
-        let mut profiles = BTreeMap::new();
-        profiles.insert(
-            "办公".into(),
-            Profile {
-                dpi_levels: vec![800, 1200],
-                active_dpi: Some(1200),
-                led: None,
-            },
-        );
-        profiles.insert(
-            "游戏".into(),
-            Profile {
-                dpi_levels: vec![400, 800, 1600, 3200],
-                active_dpi: Some(1600),
-                led: None,
-            },
-        );
+        let profiles = BTreeMap::new();
         Config {
             desired_mode: DesiredMode::Host,
             desired_dpi: None,
             dpi_levels: default_dpi_levels(),
             profiles,
             macros,
+            led_zones: BTreeMap::new(),
             battery_poll_seconds: default_poll(),
             low_battery_threshold: default_threshold(),
         }
@@ -211,6 +214,38 @@ mod tests {
         let old_action: Action = serde_json::from_str(r#"{"keys":"cmd+c"}"#).unwrap();
         assert_eq!(old_action.key_down, None);
         assert!(old_action.modifiers.is_empty());
+
+        // 旧版无 led_zones / LedSpec.rate 字段
+        let old_json = r#"{
+            "profiles": {"办公": {"dpi_levels": [800]}},
+            "led_zones": {"primary": {"effect": "solid", "rgb": [255,0,0], "brightness": 80}}
+        }"#;
+        let cfg: Config = serde_json::from_str(old_json).unwrap();
+        let spec = cfg.led_zones.get("primary").unwrap();
+        assert_eq!(spec.rate, None);
+        assert_eq!(spec.brightness, 80);
+    }
+
+    #[test]
+    fn test_default_has_no_profiles() {
+        assert!(Config::default().profiles.is_empty());
+    }
+
+    #[test]
+    fn test_led_zones_round_trip() {
+        let mut cfg = Config::default();
+        cfg.led_zones.insert(
+            "primary".into(),
+            LedSpec::new("breathing", [0, 200, 255], 75, Some("slow")),
+        );
+        cfg.led_zones
+            .insert("logo".into(), LedSpec::new("off", [0, 0, 0], 0, None));
+        let serialized = serde_json::to_string_pretty(&cfg).unwrap();
+        let decoded: Config = serde_json::from_str(&serialized).unwrap();
+        let primary = decoded.led_zones.get("primary").unwrap();
+        assert_eq!(primary.effect, "breathing");
+        assert_eq!(primary.rate.as_deref(), Some("slow"));
+        assert_eq!(decoded.led_zones.get("logo").unwrap().off, true);
     }
 
     #[test]

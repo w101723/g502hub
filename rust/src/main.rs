@@ -47,6 +47,9 @@ enum Cmd {
     Led {
         #[arg(default_value = "get")]
         action: String, // get | set
+        /// 分区:primary(主要) / logo(标志) / all
+        #[arg(long, default_value = "all")]
+        zone: String,
         /// 关闭灯效
         #[arg(long)]
         off: bool,
@@ -57,6 +60,9 @@ enum Cmd {
         effect: String,
         #[arg(long, default_value_t = 100)]
         brightness: u8,
+        /// 速率:slow/medium/fast 或毫秒数
+        #[arg(long)]
+        rate: Option<String>,
     },
     /// 配置档
     Profile {
@@ -207,26 +213,48 @@ fn cmd_dpi(action: &str, value: Option<u16>, save: bool) -> Result<()> {
 
 fn cmd_led(
     action: &str,
+    zone: &str,
     off: bool,
     color: Option<String>,
     effect: &str,
     brightness: u8,
+    rate: Option<String>,
 ) -> Result<()> {
+    let zones: Vec<u8> = match zone {
+        "all" => vec![features::led::ZONE_PRIMARY, features::led::ZONE_LOGO],
+        other => vec![features::led::zone_from_key(other)
+            .ok_or_else(|| anyhow::anyhow!("未知分区: {other} (primary/logo/all)"))?],
+    };
     with_device(|dev| {
         let l = Led::new(dev)?;
         if action == "get" {
-            let (eid, rgb) = l.get_state(0)?;
-            println!(
-                "{}",
-                serde_json::json!({"zone": 0, "effect": features::led::effect_name(eid), "rgb": rgb})
-            );
+            // f14 不回显 volatile 状态(真机校准),这里报告配置的期望状态
+            let cfg = config::load().unwrap_or_default();
+            for z in 0..2u8 {
+                let key = features::led::zone_key(z);
+                let spec = cfg.led_zones.get(key).cloned().unwrap_or(config::LedSpec {
+                    off: false,
+                    effect: "solid".into(),
+                    rgb: [255, 255, 255],
+                    brightness: 100,
+                    rate: Some("medium".into()),
+                });
+                let period = features::led::rate_period_ms(spec.rate.as_deref()).unwrap_or(0);
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "zone": key,
+                        "off": spec.off,
+                        "effect": spec.effect,
+                        "rgb": format!("#{:02x}{:02x}{:02x}", spec.rgb[0], spec.rgb[1], spec.rgb[2]),
+                        "brightness": spec.brightness,
+                        "period_ms": if spec.off { 0 } else { period },
+                    })
+                );
+            }
             return Ok(());
         }
-        if off {
-            l.set_off(0)?;
-            println!("灯效 → 关闭");
-            return Ok(());
-        }
+        let period = features::led::rate_period_ms(rate.as_deref())?;
         let rgb: [u8; 3] = match color {
             Some(c) if c.len() == 6 => [
                 u8::from_str_radix(&c[0..2], 16)?,
@@ -235,8 +263,35 @@ fn cmd_led(
             ],
             _ => [255, 255, 255],
         };
-        l.set_effect(effect, rgb, brightness, 128, 0)?;
-        println!("灯效 → {effect} #{:?} 亮度{brightness}%", rgb);
+        for z in zones {
+            if off {
+                l.set_off(z)?;
+                println!("{} 灯效 → 关闭", features::led::zone_label(z));
+            } else {
+                l.set_effect(z, effect, rgb, brightness, period)?;
+                let rate_text = if period == 0 {
+                    "默认".into()
+                } else {
+                    format!("{period}ms")
+                };
+                println!(
+                    "{} 灯效 → {effect} #{rgb:?} 亮度{brightness}% 速率{rate_text}",
+                    features::led::zone_label(z)
+                );
+            }
+            // 持久化到 led_zones,重连后自动恢复
+            let mut cfg = config::load()?;
+            cfg.led_zones.insert(
+                features::led::zone_key(z).into(),
+                config::LedSpec::new(
+                    if off { "off" } else { effect },
+                    rgb,
+                    if off { 0 } else { brightness },
+                    rate.as_deref(),
+                ),
+            );
+            config::save(&cfg)?;
+        }
         Ok(())
     })
 }
@@ -274,7 +329,8 @@ fn cmd_profile(action: &str, name: Option<String>) -> Result<()> {
             if led.off {
                 l.set_off(0)?;
             } else {
-                l.set_effect(&led.effect, led.rgb, led.brightness, 128, 0)?;
+                let period = features::led::rate_period_ms(led.rate.as_deref())?;
+                l.set_effect(0, &led.effect, led.rgb, led.brightness, period)?;
             }
         }
         let mut saved = config::load()?;
@@ -422,11 +478,21 @@ fn main() -> Result<()> {
         }) => cmd_dpi(action, *value, *save),
         Some(Cmd::Led {
             action,
+            zone,
             off,
             color,
             effect,
             brightness,
-        }) => cmd_led(action, *off, color.clone(), effect, *brightness),
+            rate,
+        }) => cmd_led(
+            action,
+            zone,
+            *off,
+            color.clone(),
+            effect,
+            *brightness,
+            rate.clone(),
+        ),
         Some(Cmd::Profile { action, name }) => cmd_profile(action, name.clone()),
         Some(Cmd::Macro { action, name }) => cmd_macro(action, name.clone()),
         Some(Cmd::Monitor { interval }) => cmd_monitor(*interval),

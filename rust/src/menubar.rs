@@ -80,6 +80,8 @@ struct App {
     macro_cancel_recording: MenuItem,
     macro_toggle: MenuItem,
     last_recording_serial: u64,
+    led_rate_items: Vec<CheckMenuItem>,
+    led_bright_items: Vec<CheckMenuItem>,
     ghub_item: MenuItem,
 }
 
@@ -120,15 +122,48 @@ impl App {
         }
 
         let led_sub = Submenu::new("RGB 灯效", true);
-        for (label, id) in [
-            ("关闭灯效", "led:off"),
-            ("白色 100%", "led:solid:ffffff"),
-            ("品红 80%", "led:solid:ff0082"),
-            ("青色 80%", "led:solid:00c8ff"),
-            ("变色循环", "led:cycle"),
-            ("呼吸(白)", "led:breathing"),
-        ] {
-            let _ = led_sub.append(&MenuItem::with_id(id, label, true, None));
+        self.led_rate_items.clear();
+        self.led_bright_items.clear();
+        for (zone_key, zone_label) in [("primary", "主要"), ("logo", "标志")] {
+            let zone_menu = Submenu::new(zone_label, true);
+            for (label, id) in [
+                ("关闭", format!("led:{zone_key}:off")),
+                ("固定:白", format!("led:{zone_key}:solid:ffffff")),
+                ("固定:品红", format!("led:{zone_key}:solid:ff0082")),
+                ("固定:青", format!("led:{zone_key}:solid:00c8ff")),
+                ("呼吸", format!("led:{zone_key}:breathing")),
+                ("循环", format!("led:{zone_key}:cycle")),
+            ] {
+                let _ = zone_menu.append(&MenuItem::with_id(id, label, true, None));
+            }
+            let _ = zone_menu.append(&PredefinedMenuItem::separator());
+            let rate_sub = Submenu::new("速率", true);
+            for (label, value) in [("慢", "slow"), ("中", "medium"), ("快", "fast")] {
+                let item = CheckMenuItem::with_id(
+                    format!("led:{zone_key}:rate:{value}"),
+                    label,
+                    true,
+                    false,
+                    None,
+                );
+                let _ = rate_sub.append(&item);
+                self.led_rate_items.push(item);
+            }
+            let _ = zone_menu.append(&rate_sub);
+            let bright_sub = Submenu::new("亮度", true);
+            for percent in [25u8, 50, 75, 100] {
+                let item = CheckMenuItem::with_id(
+                    format!("led:{zone_key}:bright:{percent}"),
+                    format!("{percent}%"),
+                    true,
+                    false,
+                    None,
+                );
+                let _ = bright_sub.append(&item);
+                self.led_bright_items.push(item);
+            }
+            let _ = zone_menu.append(&bright_sub);
+            let _ = led_sub.append(&zone_menu);
         }
         let _ = menu.append(&led_sub);
 
@@ -282,15 +317,30 @@ impl App {
             self.ghub_item.set_text("G HUB: 未运行");
             self.ghub_item.set_enabled(false);
         }
-    }
-
-    fn notify(&self, text: &str) {
-        let _ = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(format!(
-                "display notification \"{text}\" with title \"g502hub\""
-            ))
-            .spawn();
+        // 分区灯效选中态:id 形如 led:<zone>:rate:<v> / led:<zone>:bright:<n>
+        let default_spec = || config::LedSpec::new("solid", [255, 255, 255], 100, Some("medium"));
+        for item in &self.led_rate_items {
+            let parts: Vec<&str> = item.id().0.split(':').collect();
+            if let [_, zone_key, _, value] = parts[..] {
+                let spec = cfg
+                    .led_zones
+                    .get(zone_key)
+                    .cloned()
+                    .unwrap_or_else(default_spec);
+                item.set_checked(spec.rate.as_deref() == Some(value));
+            }
+        }
+        for item in &self.led_bright_items {
+            let parts: Vec<&str> = item.id().0.split(':').collect();
+            if let [_, zone_key, _, value] = parts[..] {
+                let spec = cfg
+                    .led_zones
+                    .get(zone_key)
+                    .cloned()
+                    .unwrap_or_else(default_spec);
+                item.set_checked(spec.brightness == value.parse::<u8>().unwrap_or(0));
+            }
+        }
     }
 }
 
@@ -368,6 +418,80 @@ impl Core {
         }
     }
 
+    fn handle_led_menu(&self, arg: &str) {
+        let segs: Vec<&str> = arg.split(':').collect();
+        let Some(zone) = segs
+            .first()
+            .copied()
+            .and_then(crate::features::led::zone_from_key)
+        else {
+            return;
+        };
+        let key = crate::features::led::zone_key(zone).to_string();
+        let mut spec = config::load()
+            .ok()
+            .and_then(|cfg| cfg.led_zones.get(&key).cloned())
+            .unwrap_or_else(|| config::LedSpec::new("solid", [255, 255, 255], 100, Some("medium")));
+        match &segs[1..] {
+            ["off"] => {
+                spec = config::LedSpec::new("off", [0, 0, 0], 0, spec.rate.as_deref());
+            }
+            ["solid", hex] => {
+                spec.rgb = hex_rgb(hex);
+                spec.effect = "solid".into();
+                spec.off = false;
+                spec.brightness = if *hex == "ffffff" { 100 } else { 80 };
+            }
+            [effect] => {
+                spec.effect = (*effect).into();
+                spec.off = false;
+            }
+            ["rate", value] => spec.rate = Some((*value).into()),
+            ["bright", value] => {
+                if let Ok(v) = value.parse::<u8>() {
+                    spec.brightness = v;
+                }
+            }
+            _ => return,
+        }
+        let apply = crate::device::get_conn(1).and_then(|dev| {
+            let l = Led::new(&dev)?;
+            if spec.off {
+                l.set_off(zone)
+            } else {
+                let period =
+                    crate::features::led::rate_period_ms(spec.rate.as_deref()).unwrap_or(0);
+                l.set_effect(zone, &spec.effect, spec.rgb, spec.brightness, period)
+            }
+        });
+        match apply {
+            Ok(()) => {
+                if let Ok(mut cfg) = config::load() {
+                    cfg.led_zones.insert(key, spec.clone());
+                    let _ = config::save(&cfg);
+                }
+                let summary = if spec.off {
+                    "关闭".to_string()
+                } else {
+                    format!(
+                        "{} 亮度{}% 速率 {}",
+                        spec.effect,
+                        spec.brightness,
+                        spec.rate.as_deref().unwrap_or("默认")
+                    )
+                };
+                self.notify(&format!(
+                    "{} 灯效已更新: {summary}",
+                    crate::features::led::zone_label(zone)
+                ));
+            }
+            Err(e) => self.notify(&format!("灯效失败: {e}")),
+        }
+        if let Ok(mut st) = self.state.lock() {
+            st.dirty = true;
+        }
+    }
+
     fn handle(self: &Arc<Self>, id: &str) {
         let parts: Vec<&str> = id.splitn(2, ':').collect();
         let (kind, arg) = (parts[0], parts.get(1).copied().unwrap_or(""));
@@ -410,7 +534,9 @@ impl Core {
                         if led.off {
                             l.set_off(0)?;
                         } else {
-                            l.set_effect(&led.effect, led.rgb, led.brightness, 128, 0)?;
+                            let period = crate::features::led::rate_period_ms(led.rate.as_deref())
+                                .unwrap_or(0);
+                            l.set_effect(0, &led.effect, led.rgb, led.brightness, period)?;
                         }
                     }
                     Ok((mode, dpi))
@@ -434,20 +560,7 @@ impl Core {
                     Err(e) => self.notify(&format!("应用失败: {e}")),
                 }
             }
-            ("led", arg) => {
-                let r = crate::device::get_conn(1).and_then(|dev| {
-                    let l = Led::new(&dev)?;
-                    if arg == "off" {
-                        l.set_off(0)
-                    } else {
-                        let rest = arg.strip_prefix("solid:").unwrap_or("ffffff");
-                        l.set_effect("solid", hex_rgb(rest), 100, 0, 0)
-                    }
-                });
-                if let Err(e) = r {
-                    self.notify(&format!("灯效失败: {e}"));
-                }
-            }
+            ("led", arg) => self.handle_led_menu(arg),
             ("mode", "toggle") => {
                 let current = self.state.lock().ok().and_then(|st| st.snap.mode);
                 let target = if current == Some(OnboardMode::Host) {
@@ -737,6 +850,8 @@ fn poll_loop(state: Arc<Mutex<State>>) {
                         let _ = config::save(&migrated);
                     }
                 }
+                // 灯效恢复为尽力而为:失败不影响连接与 DPI 恢复。
+                controller::apply_desired_led(&dev, &cfg);
                 let device_desc = crate::device::describe(&dev);
                 let battery = read_battery(&dev)?;
                 Ok((dev, device_desc, battery, applied))
@@ -867,6 +982,8 @@ pub fn run() -> Result<()> {
         macro_cancel_recording: MenuItem::with_id("macro:cancel-recording", "", false, None),
         macro_toggle: MenuItem::with_id("macro:toggle", "", true, None),
         last_recording_serial: recording_serial(),
+        led_rate_items: Vec::new(),
+        led_bright_items: Vec::new(),
         ghub_item: MenuItem::with_id("ghub:quit", "", false, None),
     };
     app.build_menu()?;

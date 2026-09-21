@@ -233,10 +233,6 @@ impl G502Device {
         Ok(index)
     }
 
-    pub fn has_feature(&self, feature_id: u16) -> bool {
-        self.feature(feature_id).is_ok()
-    }
-
     /// 枚举设备全部 feature id(FeatureSet f1 = GetFeatureIdByIndex)。
     pub fn list_features(&self) -> Result<Vec<u16>, HidppError> {
         let fs_index = self.feature(FEATURE_SET)?;

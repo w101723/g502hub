@@ -1,23 +1,70 @@
 //! RGB 灯效:feature 0x8070 (Color LED Effects)。
-//! 函数编号(libratbag 确认):
-//!   f0 GetInfo  f1 GetZoneInfo(z)  f2 GetZoneEffectInfo(z,e)  f3 SetZoneEffect  f14 GetZoneEffect(z)
-//! 效果 id: 0 关闭 1 固定色 3 变色循环 4 波浪 5 星光 6 按压点亮 10 呼吸 11 涟漪
-//! SetZoneEffect 参数布局按规范推断,首次使用时真机校准。
+//! 函数编号:f0 GetInfo  f1 GetZoneInfo(z)  f2 GetZoneEffectInfo(z,slot)
+//!           f3 SetZoneEffect  f14 GetZoneEffect(z)
+//! G502 LIGHTSPEED 有 2 个分区:zone 0 = 主要(灯带)、zone 1 = 标志(G logo)。
+//!
+//! 真机校准结论(2026-09,与 G HUB 设置库/protobuf 定义交叉验证):
+//!   设备固定 4 个效果槽位(f2 枚举,两分区一致):
+//!     slot 0 = off(0x0000)  slot 1 = solid(0x0001)
+//!     slot 2 = cycle(0x0003) slot 3 = breathing(0x000A)
+//!   f3 SetZoneEffect 的 16 字节 payload 按"目标槽位"解释,布局为:
+//!     off:       [zone, 0, 0...]
+//!     solid:     [zone, 1, R, G, B, 亮度(0-100)]           —— 正序 RGB,无 eid!
+//!     cycle:     [zone, 2, 0x00,0x03, 强度, 饱和度, 周期hi, 周期lo]
+//!     breathing: [zone, 3, 0x00,0x0A, R, G, B, 周期hi, 周期lo, 强度]
+//!   注意:solid 的颜色直接从字节 2 开始(不能带效果 id 字节,
+//!   否则 id 会占用 R/G 通道);cycle/breathing 的参数区以 2 字节
+//!   效果 id 开头。周期单位毫秒、大端(1000 与 8000 肉眼快慢有别)。
+//!   f14 读回恒为 0x0000,不可用于确认;写入只看传输层成功与否。
+//! 速率以 period-ms 下发,0 表示使用设备默认节奏。
 
 use crate::device::G502Device;
 use crate::hidpp::HidppError;
 
 const F_COLOR_LED_EFFECTS: u16 = 0x8070;
 
+pub const ZONE_PRIMARY: u8 = 0;
+pub const ZONE_LOGO: u8 = 1;
+
+pub const RATE_SLOW_MS: u16 = 5000;
+pub const RATE_MEDIUM_MS: u16 = 2000;
+pub const RATE_FAST_MS: u16 = 1000;
+
+/// 效果槽位/效果 id(真机 f2 枚举结果)。
+pub const SLOT_OFF: u8 = 0;
+pub const SLOT_SOLID: u8 = 1;
+pub const SLOT_CYCLE: u8 = 2;
+pub const SLOT_BREATHING: u8 = 3;
+
+pub fn zone_from_key(key: &str) -> Option<u8> {
+    match key {
+        "primary" | "0" => Some(ZONE_PRIMARY),
+        "logo" | "1" => Some(ZONE_LOGO),
+        _ => None,
+    }
+}
+
+pub fn zone_key(zone: u8) -> &'static str {
+    match zone {
+        ZONE_LOGO => "logo",
+        _ => "primary",
+    }
+}
+
+pub fn zone_label(zone: u8) -> &'static str {
+    match zone {
+        ZONE_LOGO => "标志",
+        _ => "主要",
+    }
+}
+
+#[allow(dead_code)]
 pub fn effect_id(name: &str) -> Option<u16> {
     match name {
         "off" => Some(0x00),
         "solid" => Some(0x01),
         "cycle" => Some(0x03),
-        "wave" => Some(0x04),
-        "starlight" => Some(0x05),
         "breathing" => Some(0x0A),
-        "ripple" => Some(0x0B),
         _ => None,
     }
 }
@@ -27,11 +74,28 @@ pub fn effect_name(id: u16) -> String {
         0x00 => "off".into(),
         0x01 => "solid".into(),
         0x03 => "cycle".into(),
-        0x04 => "wave".into(),
-        0x05 => "starlight".into(),
         0x0A => "breathing".into(),
-        0x0B => "ripple".into(),
         other => format!("{other:#06x}"),
+    }
+}
+
+/// 设备实际支持的效果全集(顺序即展示顺序;off 由专门菜单项处理)。
+#[allow(dead_code)]
+pub const ALL_EFFECTS: &[u16] = &[0x01, 0x0A, 0x03];
+
+/// 速率别名 → period-ms;"<毫秒>" 数字形式亦可;None/空 → 0(设备默认)。
+pub fn rate_period_ms(rate: Option<&str>) -> Result<u16, HidppError> {
+    let Some(rate) = rate else {
+        return Ok(0);
+    };
+    match rate.trim().to_lowercase().as_str() {
+        "" | "default" => Ok(0),
+        "slow" | "慢" => Ok(RATE_SLOW_MS),
+        "medium" | "mid" | "normal" | "中" => Ok(RATE_MEDIUM_MS),
+        "fast" | "快" => Ok(RATE_FAST_MS),
+        digits => digits.parse::<u16>().map_err(|_| {
+            HidppError::Invalid(format!("无效速率: {rate} (slow/medium/fast 或毫秒数)"))
+        }),
     }
 }
 
@@ -46,75 +110,159 @@ impl<'a> Led<'a> {
         Ok(Led { dev, index })
     }
 
-    pub fn zone_count(&self) -> usize {
-        self.dev
-            .request(self.index, 0x00, &[])
-            .map(|r| r[4] as usize)
-            .unwrap_or(1)
-            .max(1)
-    }
-
-    /// 读取当前效果 (f14 GetZoneEffect)。
-    pub fn get_state(&self, zone: u8) -> Result<(u16, Option<[u8; 3]>), HidppError> {
-        let resp = self
-            .dev
-            .request_long(self.index, 0x0E, &[zone, 0x00, 0x00])?;
-        let effect = ((resp[5] as u16) << 8) | resp[6] as u16;
-        let rgb = if effect == 0x01 {
-            Some([resp[7], resp[8], resp[9]])
-        } else {
-            None
-        };
-        Ok((effect, rgb))
-    }
-
+    /// 设置灯效(发送即成功;f14 不回显,无法读回确认)。
     pub fn set_effect(
         &self,
-        effect_name: &str,
+        zone: u8,
+        effect: &str,
         rgb: [u8; 3],
         brightness: u8,
-        speed: u8,
-        zone: u8,
+        period_ms: u16,
     ) -> Result<(), HidppError> {
-        let eid = effect_id(effect_name).ok_or_else(|| {
-            HidppError::Invalid(format!(
-                "未知灯效: {effect_name} (off/solid/cycle/wave/starlight/breathing/ripple)"
-            ))
-        })?;
-        self.set_zone_effect(zone, eid, rgb, brightness, speed)
+        match effect {
+            "off" => self.set_off(zone),
+            "solid" => self.set_solid(zone, rgb, brightness),
+            "cycle" => self.set_cycle(zone, period_ms, brightness),
+            "breathing" => self.set_breathing(zone, rgb, period_ms, brightness),
+            other => Err(HidppError::Invalid(format!(
+                "未知灯效: {other} (off/solid/cycle/breathing)"
+            ))),
+        }
     }
 
+    /// 关闭分区灯效(slot 0,参数全零)。
     pub fn set_off(&self, zone: u8) -> Result<(), HidppError> {
-        self.set_zone_effect(zone, 0x00, [0, 0, 0], 0, 0)
+        let params = [zone, SLOT_OFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        self.send_f3(&params)
     }
 
-    fn set_zone_effect(
-        &self,
-        zone: u8,
-        effect_id: u16,
-        rgb: [u8; 3],
-        brightness: u8,
-        speed: u8,
-    ) -> Result<(), HidppError> {
+    /// 固定色:[zone, 1, R, G, B, 亮度(0-100)]。
+    pub fn set_solid(&self, zone: u8, rgb: [u8; 3], brightness: u8) -> Result<(), HidppError> {
         let params: [u8; 16] = [
             zone,
-            0, // zone effect index
-            (effect_id >> 8) as u8,
-            effect_id as u8,
-            0, // flags/persistency
+            SLOT_SOLID,
             rgb[0],
             rgb[1],
             rgb[2],
             brightness.min(100),
-            speed,
             0,
-            0, // period ms
+            0,
+            0,
+            0,
+            0,
+            0,
             0,
             0,
             0,
             0,
         ];
-        self.dev.request_long(self.index, 0x03, &params)?;
+        self.send_f3(&params)
+    }
+
+    /// 变色循环:[zone, 2, 0x0003, 强度, 饱和度, 周期(2B 大端 ms)]。
+    /// period_ms = 0 时使用设备默认节奏(仅发默认强度/饱和度)。
+    pub fn set_cycle(&self, zone: u8, period_ms: u16, brightness: u8) -> Result<(), HidppError> {
+        let intensity = intensity_byte(brightness);
+        let params: [u8; 16] = [
+            zone,
+            SLOT_CYCLE,
+            0x00,
+            0x03,
+            intensity,
+            0xFF,
+            (period_ms >> 8) as u8,
+            period_ms as u8,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        self.send_f3(&params)
+    }
+
+    /// 呼吸:[zone, 3, 0x000A, R, G, B, 周期(2B 大端 ms), 强度]。
+    pub fn set_breathing(
+        &self,
+        zone: u8,
+        rgb: [u8; 3],
+        period_ms: u16,
+        brightness: u8,
+    ) -> Result<(), HidppError> {
+        let intensity = intensity_byte(brightness);
+        let params: [u8; 16] = [
+            zone,
+            SLOT_BREATHING,
+            0x00,
+            0x0A,
+            rgb[0],
+            rgb[1],
+            rgb[2],
+            (period_ms >> 8) as u8,
+            period_ms as u8,
+            intensity,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        self.send_f3(&params)
+    }
+
+    fn send_f3(&self, params: &[u8; 16]) -> Result<(), HidppError> {
+        self.dev.request_long(self.index, 0x03, params)?;
         Ok(())
+    }
+}
+
+/// 亮度百分比(0-100)→ 效果强度字节(0-255,cycle/breathing 用)。
+fn intensity_byte(brightness: u8) -> u8 {
+    ((brightness.min(100) as u16) * 255 / 100) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_effect_layout_constants() {
+        assert_eq!(ALL_EFFECTS, &[0x01, 0x0A, 0x03]);
+        assert_eq!(effect_id("solid"), Some(0x01));
+        assert_eq!(effect_id("cycle"), Some(0x03));
+        assert_eq!(effect_id("breathing"), Some(0x0A));
+        assert_eq!(effect_id("off"), Some(0x00));
+        assert_eq!(effect_id("wave"), None);
+        assert_eq!(intensity_byte(100), 255);
+        assert_eq!(intensity_byte(50), 127);
+        assert_eq!(intensity_byte(0), 0);
+        assert_eq!(SLOT_SOLID, 1);
+        assert_eq!(SLOT_CYCLE, 2);
+        assert_eq!(SLOT_BREATHING, 3);
+    }
+    #[test]
+    fn test_rate_period_mapping() {
+        assert_eq!(rate_period_ms(None).unwrap(), 0);
+        assert_eq!(rate_period_ms(Some("")).unwrap(), 0);
+        assert_eq!(rate_period_ms(Some("slow")).unwrap(), RATE_SLOW_MS);
+        assert_eq!(rate_period_ms(Some("medium")).unwrap(), RATE_MEDIUM_MS);
+        assert_eq!(rate_period_ms(Some("fast")).unwrap(), RATE_FAST_MS);
+        assert_eq!(rate_period_ms(Some("1500")).unwrap(), 1500);
+        assert!(rate_period_ms(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn test_effect_and_zone_labels() {
+        assert_eq!(effect_id("breathing"), Some(0x0A));
+        assert_eq!(effect_name(0x0A), "breathing");
+        assert_eq!(zone_from_key("primary"), Some(ZONE_PRIMARY));
+        assert_eq!(zone_from_key("logo"), Some(ZONE_LOGO));
+        assert_eq!(zone_from_key("bogus"), None);
+        assert_eq!(zone_key(ZONE_LOGO), "logo");
+        assert_eq!(zone_label(ZONE_PRIMARY), "主要");
     }
 }

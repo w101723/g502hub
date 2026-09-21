@@ -24,14 +24,6 @@ impl<'a> Dpi<'a> {
         })
     }
 
-    pub fn sensor_count(&self) -> u8 {
-        self.dev
-            .request(self.index, 0x00, &[])
-            .map(|r| r[4])
-            .unwrap_or(1)
-            .max(1)
-    }
-
     /// 获取支持的 DPI 档位(展开范围条目),按需分页。
     pub fn dpi_list(&self) -> Result<Vec<u16>, HidppError> {
         if let Some(v) = &*self.cache.borrow() {
@@ -90,7 +82,7 @@ impl<'a> Dpi<'a> {
             // 为 0 时取默认 DPI
             dpi = ((resp[7] as u16) << 8) | resp[8] as u16;
         }
-        if !(50..=32000).contains(&dpi) {
+        if !(100..=25600).contains(&dpi) {
             return Err(HidppError::Invalid(format!("DPI 读取异常: {dpi}")));
         }
         Ok(dpi)
@@ -99,8 +91,10 @@ impl<'a> Dpi<'a> {
     /// 设置 DPI，并读回传感器运行值确认。0x2201 f3 是易失写入，
     /// 睡眠/重连后需要由上层恢复期望值。
     pub fn set_dpi(&self, dpi: u16) -> Result<u16, HidppError> {
-        if !(50..=32000).contains(&dpi) {
-            return Err(HidppError::Invalid(format!("DPI 超出合理范围: {dpi}")));
+        if !(100..=25600).contains(&dpi) {
+            return Err(HidppError::Invalid(format!(
+                "DPI 超出支持范围(100-25600): {dpi}"
+            )));
         }
         let resp = self
             .dev
