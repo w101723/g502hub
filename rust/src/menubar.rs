@@ -174,10 +174,10 @@ impl App {
             }
             let _ = zone_menu.append(&PredefinedMenuItem::separator());
             let rate_sub = Submenu::new("速率", true);
-            for (label, value) in [("慢", "slow"), ("中", "medium"), ("快", "fast")] {
+            for ms in [1000u16, 2000, 3000, 5000, 8000, 10000, 15000, 20000] {
                 let item = CheckMenuItem::with_id(
-                    format!("led:{zone_key}:rate:{value}"),
-                    label,
+                    format!("led:{zone_key}:rate:{ms}"),
+                    format!("{ms}ms"),
                     true,
                     false,
                     None,
@@ -493,7 +493,21 @@ impl Core {
                 spec.effect = (*effect).into();
                 spec.off = false;
             }
-            ["rate", value] => spec.rate = Some((*value).into()),
+            ["rate", value] => {
+                spec.rate = Some((*value).into());
+                if spec.off {
+                    // 灯效关闭时速率仅保存,不写设备
+                    if let Ok(mut cfg) = config::load() {
+                        cfg.led_zones.insert(key, spec.clone());
+                        let _ = config::save(&cfg);
+                    }
+                    self.notify("速率已保存,开启呼吸/循环后生效");
+                    if let Ok(mut st) = self.state.lock() {
+                        st.dirty = true;
+                    }
+                    return;
+                }
+            }
             ["bright", value] => {
                 if let Ok(v) = value.parse::<u8>() {
                     spec.brightness = v;

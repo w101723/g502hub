@@ -93,11 +93,26 @@ pub fn rate_period_ms(rate: Option<&str>) -> Result<u16, HidppError> {
         "slow" | "慢" => Ok(RATE_SLOW_MS),
         "medium" | "mid" | "normal" | "中" => Ok(RATE_MEDIUM_MS),
         "fast" | "快" => Ok(RATE_FAST_MS),
-        digits => digits.parse::<u16>().map_err(|_| {
-            HidppError::Invalid(format!("无效速率: {rate} (slow/medium/fast 或毫秒数)"))
-        }),
+        digits => {
+            let v: u16 = digits.parse().map_err(|_| {
+                HidppError::Invalid(format!("无效速率: {rate} (slow/medium/fast 或毫秒数)"))
+            })?;
+            // 官方(G HUB)速率范围 1000–20000ms;越界值会被固件接受
+            // 但会卡死效果引擎(真机实测 500ms 导致呼吸失效直到重建配置)
+            if !(RATE_MIN_MS..=RATE_MAX_MS).contains(&v) {
+                return Err(HidppError::Invalid(format!(
+                    "速率超出范围: {v}ms (官方支持 1000–20000ms)"
+                )));
+            }
+            Ok(v)
+        }
     }
 }
+
+/// 官方速率下限(G HUB UI 显示 1000ms)。
+pub const RATE_MIN_MS: u16 = 1000;
+/// 官方速率上限(G HUB UI 显示 20000ms)。
+pub const RATE_MAX_MS: u16 = 20000;
 
 pub struct Led<'a> {
     dev: &'a G502Device,
@@ -136,8 +151,9 @@ impl<'a> Led<'a> {
         self.send_f3(&params)
     }
 
-    /// 固定色:[zone, 1, R, G, B, 亮度(0-100)]。
+    /// 固定色:[zone, 1, R, G, B, 亮度(0-100)]。亮度靠缩放 RGB 实现。
     pub fn set_solid(&self, zone: u8, rgb: [u8; 3], brightness: u8) -> Result<(), HidppError> {
+        let rgb = scale_rgb(rgb, brightness);
         let params: [u8; 16] = [
             zone,
             SLOT_SOLID,
@@ -162,11 +178,12 @@ impl<'a> Led<'a> {
     /// 变色循环:[zone, 2, 0x0003, 强度, 饱和度, 周期(2B 大端 ms)]。
     pub fn set_cycle(&self, zone: u8, period_ms: u16, brightness: u8) -> Result<(), HidppError> {
         let intensity = intensity_byte(brightness);
-        // 真机实测:周期 0 不渲染,0(即"默认速率")以 2000ms 下发
+        // 周期 0(即"默认速率")以 2000ms 下发;其余值收紧到官方
+        // 1000–20000ms——越界值会被固件接受但卡死效果引擎(真机实测)
         let period = if period_ms == 0 {
             RATE_MEDIUM_MS
         } else {
-            period_ms
+            period_ms.clamp(RATE_MIN_MS, RATE_MAX_MS)
         };
         let params: [u8; 16] = [
             zone,
@@ -198,12 +215,14 @@ impl<'a> Led<'a> {
         brightness: u8,
     ) -> Result<(), HidppError> {
         let intensity = intensity_byte(brightness);
-        // 真机实测:周期 0 不渲染,0(即"默认速率")以 2000ms 下发
+        // 周期 0(即"默认速率")以 2000ms 下发;其余值收紧到官方
+        // 1000–20000ms——越界值会被固件接受但卡死效果引擎(真机实测)
         let period = if period_ms == 0 {
             RATE_MEDIUM_MS
         } else {
-            period_ms
+            period_ms.clamp(RATE_MIN_MS, RATE_MAX_MS)
         };
+        let rgb = scale_rgb(rgb, brightness);
         let params: [u8; 16] = [
             zone,
             SLOT_BREATHING,
@@ -236,9 +255,134 @@ fn intensity_byte(brightness: u8) -> u8 {
     ((brightness.min(100) as u16) * 255 / 100) as u8
 }
 
+/// 按亮度百分比缩放 RGB。
+/// 固件的 f3 亮度/强度字节经真机实测不改变实际亮度,亮度由软件
+/// 缩放颜色实现(与 G HUB 的全局亮度行为一致)。
+fn scale_rgb(rgb: [u8; 3], brightness: u8) -> [u8; 3] {
+    let b = brightness.min(100) as u16;
+    [
+        (rgb[0] as u16 * b / 100) as u8,
+        (rgb[1] as u16 * b / 100) as u8,
+        (rgb[2] as u16 * b / 100) as u8,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hex(data: &[u8]) -> String {
+        data.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    }
+
+    /// 呼吸变常亮诊断:逐窗口发送对照字节(真机,肉眼确认):
+    /// `cargo test live_led_breath_check -- --ignored --nocapture`
+    /// 每窗口 5 秒。W1=当初校准成功的原始字节;W2=当前 API(应与 W1 同字节);
+    /// W3=强度 0x40;W4=solid 对照;W5=先 off 再 breathing。
+    #[test]
+    #[ignore]
+    fn live_led_breath_check() {
+        let dev = crate::device::G502Device::open().expect("设备未连接");
+        let index = dev.feature(F_COLOR_LED_EFFECTS).expect("无 0x8070");
+        let send = |name: &str, params: [u8; 16]| {
+            println!("{name}: {}", hex(&params));
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let _ = dev
+                .transport
+                .request(dev.dev_index, index, 0x03, &params, true, 800);
+        };
+        let sleep5 = || {
+            for _ in 0..5 {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        };
+        send(
+            "W1 原始字节",
+            [
+                0, 3, 0x00, 0x0A, 0xFF, 0x00, 0x00, 0x03, 0xE8, 0xFF, 0, 0, 0, 0, 0, 0,
+            ],
+        );
+        sleep5();
+        let l = Led::new(&dev).unwrap();
+        let mut p2 = [0u8; 16];
+        p2[0] = 0;
+        p2[1] = SLOT_BREATHING;
+        p2[2] = 0x00;
+        p2[3] = 0x0A;
+        p2[4] = 0xFF;
+        p2[7] = 0x03;
+        p2[8] = 0xE8;
+        p2[9] = 0xFF;
+        send("W2 仅R+周期+强度", p2);
+        sleep5();
+        send(
+            "W3 强度0x40",
+            [
+                0, 3, 0x00, 0x0A, 0xFF, 0x00, 0x00, 0x03, 0xE8, 0x40, 0, 0, 0, 0, 0, 0,
+            ],
+        );
+        sleep5();
+        send(
+            "W4 solid对照",
+            [0, 1, 0xFF, 0x00, 0x00, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        );
+        sleep5();
+        l.set_off(0).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        l.set_breathing(0, [0xFF, 0, 0], 1000, 100).unwrap();
+        println!("W5 off后breathing(1000)");
+        sleep5();
+        l.set_off(0).unwrap();
+        println!("结束已关灯");
+    }
+
+    /// 解锁卡死的呼吸/循环引擎:回写出厂默认参数(真机,肉眼确认):
+    /// `cargo test live_led_unwedge -- --ignored --nocapture`
+    /// 每窗口 6 秒:W1 呼吸默认参数 W2 循环默认参数 W3 呼吸正常参数
+    #[test]
+    #[ignore]
+    fn live_led_unwedge() {
+        let dev = crate::device::G502Device::open().expect("设备未连接");
+        let index = dev.feature(F_COLOR_LED_EFFECTS).expect("无 0x8070");
+        let send = |name: &str, params: [u8; 16]| {
+            println!("{name}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let _ = dev
+                .transport
+                .request(dev.dev_index, index, 0x03, &params, true, 800);
+        };
+        for _ in 0..6 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        send(
+            "W1 breathing 默认参数",
+            [
+                0, 3, 0x00, 0x0A, 0xC1, 0x05, 0x00, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        );
+        for _ in 0..6 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        send(
+            "W2 cycle 默认参数",
+            [
+                0, 2, 0x00, 0x03, 0xC0, 0x05, 0x03, 0xE8, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        );
+        for _ in 0..6 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        send(
+            "W3 breathing red 1000",
+            [
+                0, 3, 0x00, 0x0A, 0xFF, 0x00, 0x00, 0x03, 0xE8, 0xFF, 0, 0, 0, 0, 0, 0,
+            ],
+        );
+        for _ in 0..6 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        println!("结束");
+    }
 
     #[test]
     fn test_effect_layout_constants() {
@@ -251,6 +395,9 @@ mod tests {
         assert_eq!(intensity_byte(100), 255);
         assert_eq!(intensity_byte(50), 127);
         assert_eq!(intensity_byte(0), 0);
+        assert_eq!(scale_rgb([255, 100, 0], 50), [127, 50, 0]);
+        assert_eq!(scale_rgb([200, 200, 200], 100), [200, 200, 200]);
+        assert_eq!(scale_rgb([255, 255, 255], 0), [0, 0, 0]);
         assert_eq!(SLOT_SOLID, 1);
         assert_eq!(SLOT_CYCLE, 2);
         assert_eq!(SLOT_BREATHING, 3);
@@ -264,6 +411,11 @@ mod tests {
         assert_eq!(rate_period_ms(Some("fast")).unwrap(), RATE_FAST_MS);
         assert_eq!(rate_period_ms(Some("1500")).unwrap(), 1500);
         assert!(rate_period_ms(Some("bogus")).is_err());
+        assert!(rate_period_ms(Some("50")).is_err());
+        assert!(rate_period_ms(Some("999")).is_err());
+        assert_eq!(rate_period_ms(Some("1000")).unwrap(), 1000);
+        assert_eq!(rate_period_ms(Some("20000")).unwrap(), 20000);
+        assert!(rate_period_ms(Some("20001")).is_err());
     }
 
     #[test]
