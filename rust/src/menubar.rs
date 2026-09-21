@@ -1,0 +1,957 @@
+//! 菜单栏常驻应用。
+//!
+//! 架构:主线程跑 NSApplication.run() + CFRunLoopTimer(0.2s)泵。
+//! Timer 回调:轮询菜单事件 → 执行动作;状态变化 → **原地更新**菜单项文本/勾选
+//! (绝不整体替换菜单,避免替换打开中的菜单;也绝不在持锁状态下嵌套加锁)。
+//! 电量轮询在独立线程,只写共享 State。
+
+use crate::config::{self, Config, DesiredMode, MacroBinding};
+use crate::controller;
+use crate::device::{
+    connection_interface_unchanged, g502_interface_present, ghub_agent_running,
+    invalidate_connection, G502Device,
+};
+use crate::features::battery::{read_battery, BatteryInfo};
+use crate::features::dpi::Dpi;
+use crate::features::led::Led;
+use crate::features::onboard::OnboardMode;
+use crate::macro_engine::{
+    accessibility_granted, recording_outcome_pending, recording_phase, recording_serial,
+    take_recording_outcome, MacroTap, RecordingKind, RecordingOutcome, RecordingPhase,
+    RecordingResult,
+};
+use anyhow::Result;
+use core_foundation_sys::date::CFAbsoluteTimeGetCurrent;
+use core_foundation_sys::runloop::{
+    kCFRunLoopCommonModes, CFRunLoopAddTimer, CFRunLoopGetMain, CFRunLoopTimerContext,
+    CFRunLoopTimerCreate, CFRunLoopTimerRef,
+};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+use objc2_foundation::MainThreadMarker;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+
+static QUIT: AtomicBool = AtomicBool::new(false);
+static ACTION_TX: std::sync::OnceLock<mpsc::Sender<String>> = std::sync::OnceLock::new();
+
+// ---------------------------------------------------------------------- //
+#[derive(Default, Clone)]
+struct Snapshot {
+    device_desc: Option<String>,
+    battery: Option<BatteryInfo>,
+    dpi: Option<u16>,
+    mode: Option<OnboardMode>,
+    error: Option<String>,
+}
+
+struct State {
+    snap: Snapshot,
+    dirty: bool,
+}
+
+/// 动作执行核心(工作线程持有,不碰 UI)
+struct Core {
+    state: Arc<Mutex<State>>,
+    tap: Arc<MacroTap>,
+    cfg: Config,
+}
+
+struct App {
+    state: Arc<Mutex<State>>,
+    tray: TrayIcon,
+    tap: Arc<MacroTap>,
+    cfg: Config,
+    // ---- 常驻菜单项(原地更新) ----
+    header: MenuItem,
+    battery_line: MenuItem,
+    mode_line: MenuItem,
+    mode_action: MenuItem,
+    dpi_items: Vec<CheckMenuItem>,
+    macro_status: MenuItem,
+    macro_g4: MenuItem,
+    macro_g5: MenuItem,
+    macro_record_shortcut: MenuItem,
+    macro_record_sequence: MenuItem,
+    macro_finish_recording: MenuItem,
+    macro_cancel_recording: MenuItem,
+    macro_toggle: MenuItem,
+    last_recording_serial: u64,
+    ghub_item: MenuItem,
+}
+
+impl App {
+    fn build_menu(&mut self) -> Result<()> {
+        let menu = Menu::new();
+        self.header = MenuItem::with_id("noop", "G502 未连接", false, None);
+        self.battery_line = MenuItem::with_id("noop", "", false, None);
+        self.mode_line = MenuItem::with_id("noop", "", false, None);
+        self.mode_action = MenuItem::with_id("mode:toggle", "切换控制模式", false, None);
+        let _ = menu.append(&self.header);
+        let _ = menu.append(&self.battery_line);
+        let _ = menu.append(&self.mode_line);
+        let _ = menu.append(&self.mode_action);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+
+        let dpi_sub = Submenu::new("灵敏度 DPI", true);
+        self.dpi_items.clear();
+        for lvl in &self.cfg.dpi_levels {
+            let item =
+                CheckMenuItem::with_id(format!("dpi:{lvl}"), format!("{lvl}"), true, false, None);
+            let _ = dpi_sub.append(&item);
+            self.dpi_items.push(item);
+        }
+        let _ = menu.append(&dpi_sub);
+
+        if !self.cfg.profiles.is_empty() {
+            let sub = Submenu::new("配置档", true);
+            for name in self.cfg.profiles.keys() {
+                let _ = sub.append(&MenuItem::with_id(
+                    format!("profile:{name}"),
+                    name.clone(),
+                    true,
+                    None,
+                ));
+            }
+            let _ = menu.append(&sub);
+        }
+
+        let led_sub = Submenu::new("RGB 灯效", true);
+        for (label, id) in [
+            ("关闭灯效", "led:off"),
+            ("白色 100%", "led:solid:ffffff"),
+            ("品红 80%", "led:solid:ff0082"),
+            ("青色 80%", "led:solid:00c8ff"),
+            ("变色循环", "led:cycle"),
+            ("呼吸(白)", "led:breathing"),
+        ] {
+            let _ = led_sub.append(&MenuItem::with_id(id, label, true, None));
+        }
+        let _ = menu.append(&led_sub);
+
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        self.macro_status = MenuItem::with_id("noop", "侧键宏:未启用", false, None);
+        self.macro_g4 = MenuItem::with_id("noop", "G4 / 后退(button3): 未绑定", false, None);
+        self.macro_g5 = MenuItem::with_id("noop", "G5 / 前进(button4): 未绑定", false, None);
+        self.macro_record_shortcut =
+            MenuItem::with_id("macro:record-shortcut", "录制快捷键宏…", true, None);
+        self.macro_record_sequence =
+            MenuItem::with_id("macro:record-sequence", "录制按键序列宏…", true, None);
+        self.macro_finish_recording =
+            MenuItem::with_id("macro:finish-recording", "结束并保存序列", false, None);
+        self.macro_cancel_recording =
+            MenuItem::with_id("macro:cancel-recording", "取消录制", false, None);
+        self.macro_toggle = MenuItem::with_id("macro:toggle", "启用宏引擎", true, None);
+        let _ = menu.append(&self.macro_status);
+        let _ = menu.append(&self.macro_g4);
+        let _ = menu.append(&self.macro_g5);
+        let _ = menu.append(&self.macro_record_shortcut);
+        let _ = menu.append(&self.macro_record_sequence);
+        let _ = menu.append(&self.macro_finish_recording);
+        let _ = menu.append(&self.macro_cancel_recording);
+        let _ = menu.append(&self.macro_toggle);
+
+        self.ghub_item = MenuItem::with_id("ghub:quit", "G HUB: 未运行", false, None);
+        let _ = menu.append(&self.ghub_item);
+
+        let _ = menu.append(&MenuItem::with_id(
+            "config:open",
+            "打开配置文件",
+            true,
+            None,
+        ));
+        let _ = menu.append(&MenuItem::with_id("app:quit", "退出 g502hub", true, None));
+
+        self.tray.set_menu(Some(Box::new(menu)));
+        Ok(())
+    }
+
+    /// 状态变化后**原地刷新**菜单项(不重建、不替换)。
+    fn refresh_menu(&self, snap: &Snapshot) {
+        match (&snap.device_desc, &snap.battery) {
+            (Some(desc), Some(b)) => {
+                let volt = b
+                    .voltage_mv
+                    .map(|v| format!(" · {v}mV"))
+                    .unwrap_or_default();
+                self.header.set_text(desc.clone());
+                self.battery_line
+                    .set_text(format!("🔋{}% {}{volt}", b.percent, b.state_text));
+            }
+            (Some(desc), None) => {
+                self.header.set_text(desc.clone());
+                self.battery_line.set_text("");
+            }
+            _ => {
+                self.header.set_text("G502 未连接".to_string());
+                self.battery_line.set_text("");
+            }
+        }
+        match snap.mode {
+            Some(OnboardMode::Onboard) => {
+                self.mode_line.set_text("模式: 板载控制 · 固件配置接管");
+                self.mode_action.set_text("切换到主机控制模式");
+                self.mode_action.set_enabled(true);
+            }
+            Some(OnboardMode::Host) => {
+                self.mode_line.set_text("模式: 主机控制 · 自动恢复 DPI");
+                self.mode_action.set_text("切换到板载模式");
+                self.mode_action.set_enabled(true);
+            }
+            None => {
+                self.mode_line.set_text("");
+                self.mode_action.set_enabled(false);
+            }
+        }
+        for (i, lvl) in self.cfg.dpi_levels.iter().enumerate() {
+            if let Some(item) = self.dpi_items.get(i) {
+                item.set_checked(snap.dpi == Some(*lvl));
+            }
+        }
+        let cfg = config::load().unwrap_or_else(|_| self.cfg.clone());
+        let binding_text = |key: &str| {
+            cfg.macros
+                .get(key)
+                .map(|m| {
+                    let name = m.name.clone().unwrap_or_else(|| "未命名".into());
+                    format!("{name} [{}]", if m.enabled { "启用" } else { "停用" })
+                })
+                .unwrap_or_else(|| "未绑定".into())
+        };
+        self.macro_g4
+            .set_text(format!("G4 / 后退(button3): {}", binding_text("mouse3")));
+        self.macro_g5
+            .set_text(format!("G5 / 前进(button4): {}", binding_text("mouse4")));
+        let running = self.tap.is_running();
+        let phase = recording_phase();
+        let recording = !matches!(phase, RecordingPhase::Idle);
+        self.macro_record_shortcut.set_enabled(!recording);
+        self.macro_record_sequence.set_enabled(!recording);
+        self.macro_finish_recording
+            .set_enabled(matches!(phase, RecordingPhase::Sequence { .. }));
+        self.macro_cancel_recording.set_enabled(recording);
+        self.macro_toggle.set_enabled(!recording);
+
+        if running {
+            self.tap.update_bindings(cfg.macros.clone());
+            self.macro_toggle.set_text("停用宏引擎");
+            match phase {
+                RecordingPhase::AwaitMouse(RecordingKind::Shortcut) => {
+                    self.macro_status.set_text("录制快捷键:请按目标鼠标侧键");
+                }
+                RecordingPhase::AwaitMouse(RecordingKind::Sequence) => {
+                    self.macro_status.set_text("录制序列:请按目标鼠标侧键");
+                }
+                RecordingPhase::Shortcut { button } => {
+                    self.macro_status
+                        .set_text(format!("mouse{button} 已选:请按一次键盘组合"));
+                }
+                RecordingPhase::Sequence { button, events } => {
+                    self.macro_status
+                        .set_text(format!("mouse{button} 序列录制中 · {events} 个事件"));
+                }
+                RecordingPhase::Idle => {
+                    let count = cfg.macros.values().filter(|m| m.enabled).count();
+                    let recent = self
+                        .tap
+                        .last_button()
+                        .map(|b| match b {
+                            3 => " · 最近 G4/button3".to_string(),
+                            4 => " · 最近 G5/button4".to_string(),
+                            _ => format!(" · 最近 button{b}"),
+                        })
+                        .unwrap_or_default();
+                    self.macro_status
+                        .set_text(format!("侧键宏:运行中({count} 个绑定){recent}"));
+                }
+            }
+        } else if !accessibility_granted(false) {
+            self.macro_status.set_text("侧键宏:需要辅助功能权限");
+            self.macro_toggle.set_text("启用宏引擎");
+        } else {
+            self.macro_status.set_text("侧键宏:未启用");
+            self.macro_toggle.set_text("启用宏引擎");
+        }
+        if ghub_agent_running() {
+            self.ghub_item.set_text("⚠️ G HUB 运行中 → 退出它");
+            self.ghub_item.set_enabled(true);
+        } else {
+            self.ghub_item.set_text("G HUB: 未运行");
+            self.ghub_item.set_enabled(false);
+        }
+    }
+
+    fn notify(&self, text: &str) {
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(format!(
+                "display notification \"{text}\" with title \"g502hub\""
+            ))
+            .spawn();
+    }
+}
+
+impl Core {
+    fn start_recording(&self, kind: RecordingKind) {
+        if !accessibility_granted(false) {
+            accessibility_granted(true);
+            self.notify("请先在系统设置中允许 g502hub 辅助功能权限");
+            return;
+        }
+        if !self.tap.is_running() {
+            if let Err(e) = self.tap.start() {
+                self.notify(&format!("宏引擎启动失败: {e}"));
+                return;
+            }
+        }
+        match self.tap.begin_recording(kind) {
+            Ok(()) => self.notify(match kind {
+                RecordingKind::Shortcut => "请按要绑定的鼠标侧键，然后按键盘组合",
+                RecordingKind::Sequence => "请按要绑定的鼠标侧键，然后开始键盘录制",
+            }),
+            Err(e) => self.notify(&format!("开始录制失败: {e}")),
+        }
+    }
+
+    fn save_recording(&self, result: RecordingResult) {
+        let key = format!("mouse{}", result.button);
+        let replaced = config::load()
+            .ok()
+            .and_then(|cfg| cfg.macros.get(&key).cloned())
+            .is_some();
+        let mut cfg = match config::load() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                self.notify(&format!("读取配置失败: {e}"));
+                return;
+            }
+        };
+        let kind_name = match result.kind {
+            RecordingKind::Shortcut => "快捷键",
+            RecordingKind::Sequence => "按键序列",
+        };
+        cfg.macros.insert(
+            key.clone(),
+            MacroBinding {
+                name: Some(format!("录制{kind_name}: {}", result.label)),
+                enabled: true,
+                actions: result.actions,
+            },
+        );
+        if let Err(e) = config::save(&cfg) {
+            self.notify(&format!("保存宏失败: {e}"));
+            return;
+        }
+        self.tap.update_bindings(cfg.macros);
+        let button = match result.button {
+            3 => "G4 / mouse3".to_string(),
+            4 => "G5 / mouse4".to_string(),
+            n => format!("button{n} / mouse{n}"),
+        };
+        self.notify(&format!(
+            "{button} 已{}为 {}",
+            if replaced { "替换" } else { "绑定" },
+            result.label
+        ));
+    }
+
+    fn handle_recording_outcome(&self, outcome: RecordingOutcome) {
+        match outcome {
+            RecordingOutcome::Completed(result) => self.save_recording(result),
+            RecordingOutcome::Cancelled(reason) => self.notify(&format!("录制已取消: {reason}")),
+        }
+        if let Ok(mut st) = self.state.lock() {
+            st.dirty = true;
+        }
+    }
+
+    fn handle(self: &Arc<Self>, id: &str) {
+        let parts: Vec<&str> = id.splitn(2, ':').collect();
+        let (kind, arg) = (parts[0], parts.get(1).copied().unwrap_or(""));
+        match (kind, arg) {
+            ("noop", _) => {}
+            ("dpi", v) => {
+                if let Ok(val) = v.parse::<u16>() {
+                    let r = crate::device::get_conn(2)
+                        .and_then(|dev| controller::set_dpi_confirmed(&dev, val));
+                    match r {
+                        Ok(actual) => {
+                            if let Ok(mut cfg) = config::load() {
+                                cfg.desired_mode = DesiredMode::Host;
+                                cfg.desired_dpi = Some(actual);
+                                let _ = config::save(&cfg);
+                            }
+                            if let Ok(mut st) = self.state.lock() {
+                                st.snap.dpi = Some(actual);
+                                st.snap.mode = Some(OnboardMode::Host);
+                                st.dirty = true;
+                            }
+                            self.notify(&format!("DPI 已确认: {actual}"));
+                        }
+                        Err(e) => self.notify(&format!("DPI 设置失败: {e}")),
+                    }
+                }
+            }
+            ("profile", name) => {
+                let Some(p) = self.cfg.profiles.get(name).cloned() else {
+                    return;
+                };
+                let target_dpi = p.active_dpi.or_else(|| p.dpi_levels.last().copied());
+                let r = crate::device::get_conn(2).and_then(|dev| {
+                    let mode = controller::set_mode_confirmed(&dev, OnboardMode::Host)?;
+                    let dpi = target_dpi
+                        .map(|v| Dpi::new(&dev).and_then(|d| d.set_dpi(v)))
+                        .transpose()?;
+                    if let Some(led) = &p.led {
+                        let l = Led::new(&dev)?;
+                        if led.off {
+                            l.set_off(0)?;
+                        } else {
+                            l.set_effect(&led.effect, led.rgb, led.brightness, 128, 0)?;
+                        }
+                    }
+                    Ok((mode, dpi))
+                });
+                match r {
+                    Ok((mode, dpi)) => {
+                        if let Ok(mut cfg) = config::load() {
+                            cfg.desired_mode = DesiredMode::Host;
+                            if let Some(dpi) = dpi {
+                                cfg.desired_dpi = Some(dpi);
+                            }
+                            let _ = config::save(&cfg);
+                        }
+                        if let Ok(mut st) = self.state.lock() {
+                            st.snap.mode = Some(mode);
+                            st.snap.dpi = dpi;
+                            st.dirty = true;
+                        }
+                        self.notify(&format!("已确认配置档「{name}」"));
+                    }
+                    Err(e) => self.notify(&format!("应用失败: {e}")),
+                }
+            }
+            ("led", arg) => {
+                let r = crate::device::get_conn(1).and_then(|dev| {
+                    let l = Led::new(&dev)?;
+                    if arg == "off" {
+                        l.set_off(0)
+                    } else {
+                        let rest = arg.strip_prefix("solid:").unwrap_or("ffffff");
+                        l.set_effect("solid", hex_rgb(rest), 100, 0, 0)
+                    }
+                });
+                if let Err(e) = r {
+                    self.notify(&format!("灯效失败: {e}"));
+                }
+            }
+            ("mode", "toggle") => {
+                let current = self.state.lock().ok().and_then(|st| st.snap.mode);
+                let target = if current == Some(OnboardMode::Host) {
+                    OnboardMode::Onboard
+                } else {
+                    OnboardMode::Host
+                };
+                let r = crate::device::get_conn(2).and_then(|dev| {
+                    let actual = controller::set_mode_confirmed(&dev, target)?;
+                    let dpi = if actual == OnboardMode::Host {
+                        let cfg = config::load().unwrap_or_else(|_| self.cfg.clone());
+                        cfg.desired_dpi
+                            .map(|v| Dpi::new(&dev).and_then(|d| d.set_dpi(v)))
+                            .transpose()?
+                    } else {
+                        Dpi::new(&dev).and_then(|d| d.get_dpi()).ok()
+                    };
+                    Ok((actual, dpi))
+                });
+                match r {
+                    Ok((actual, dpi)) => {
+                        if let Ok(mut cfg) = config::load() {
+                            cfg.desired_mode = if actual == OnboardMode::Host {
+                                DesiredMode::Host
+                            } else {
+                                DesiredMode::Onboard
+                            };
+                            let _ = config::save(&cfg);
+                        }
+                        if let Ok(mut st) = self.state.lock() {
+                            st.snap.mode = Some(actual);
+                            st.snap.dpi = dpi;
+                            st.dirty = true;
+                        }
+                        self.notify(&format!("模式已确认: {}", actual.name()));
+                    }
+                    Err(e) => self.notify(&format!("模式切换失败: {e}")),
+                }
+            }
+            ("macro", "record-shortcut") => {
+                self.start_recording(RecordingKind::Shortcut);
+            }
+            ("macro", "record-sequence") => {
+                self.start_recording(RecordingKind::Sequence);
+            }
+            ("macro", "finish-recording") => {
+                if let Err(e) = self.tap.finish_sequence() {
+                    self.notify(&format!("结束录制失败: {e}"));
+                }
+            }
+            ("macro", "cancel-recording") => {
+                self.tap.cancel_recording("用户取消");
+            }
+            ("macro", "poll-recording") => {
+                self.tap.expire_recording();
+                if let Some(outcome) = take_recording_outcome() {
+                    self.handle_recording_outcome(outcome);
+                }
+            }
+            ("macro", "toggle") => {
+                crate::macro_engine::mlog("菜单点击:切换宏引擎");
+                if self.tap.is_running() {
+                    self.tap.stop();
+                    self.notify("宏引擎已停用(侧键恢复默认)");
+                } else {
+                    if !accessibility_granted(false) {
+                        accessibility_granted(true);
+                        self.notify("请在系统设置中允许 g502hub,然后再次启用");
+                        return;
+                    }
+                    if let Err(e) = self.tap.start() {
+                        self.notify(&format!("宏引擎启动失败: {e}"));
+                    } else {
+                        self.notify("宏引擎已启用:按绑定的侧键试试");
+                    }
+                }
+                // 立即刷新菜单文字(运行中/未启用),给用户可见反馈
+                if let Ok(mut st) = self.state.lock() {
+                    st.dirty = true;
+                }
+            }
+            ("ghub", "quit") => {
+                let _ = std::process::Command::new("osascript")
+                    .arg("-e")
+                    .arg("tell application \"lghub\" to quit")
+                    .spawn();
+                std::thread::sleep(Duration::from_millis(1500));
+                if ghub_agent_running() {
+                    let _ = std::process::Command::new("pkill")
+                        .arg("-x")
+                        .arg("lghub_agent")
+                        .spawn();
+                    let _ = std::process::Command::new("pkill")
+                        .arg("-x")
+                        .arg("lghub_system_tray")
+                        .spawn();
+                }
+            }
+            ("config", "open") => {
+                let path = config::config_path();
+                let _ = std::fs::create_dir_all(path.parent().unwrap());
+                if !path.exists() {
+                    let _ = config::save(&Config::default());
+                }
+                let _ = std::process::Command::new("open").arg(&path).spawn();
+            }
+            ("app", "quit") => QUIT.store(true, Ordering::Relaxed),
+            _ => {}
+        }
+        if let Ok(mut st) = self.state.lock() {
+            st.dirty = true;
+        }
+    }
+    fn notify(&self, text: &str) {
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(format!(
+                "display notification \"{text}\" with title \"g502hub\""
+            ))
+            .spawn();
+    }
+}
+
+fn hex_rgb(s: &str) -> [u8; 3] {
+    if s.len() != 6 {
+        return [255, 255, 255];
+    }
+    let b = |r: std::ops::Range<usize>| u8::from_str_radix(&s[r], 16).unwrap_or(255);
+    [b(0..2), b(2..4), b(4..6)]
+}
+
+fn point_in_polygon(x: f32, y: f32, points: &[(f32, f32)]) -> bool {
+    let mut inside = false;
+    let mut j = points.len() - 1;
+    for i in 0..points.len() {
+        let (xi, yi) = points[i];
+        let (xj, yj) = points[j];
+        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// 生成 36×36 macOS Template 圆环。系统负责颜色，Alpha 区分底轨与电量弧。
+fn make_icon(snap: &Snapshot) -> Result<Icon> {
+    let (w, h) = (36u32, 36u32);
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    let battery = snap.battery.as_ref();
+    let connected = snap.device_desc.is_some() && battery.is_some();
+    let level = battery.map(|b| b.percent).unwrap_or(0) as f32 / 100.0;
+    let charging = battery.map(|b| b.charging).unwrap_or(false);
+    let tau = std::f32::consts::TAU;
+    let radius = 14.0f32;
+    let progress_angle = tau * level.clamp(0.0, 1.0);
+    let end_x = 18.0 + radius * progress_angle.sin();
+    let end_y = 18.0 - radius * progress_angle.cos();
+
+    for y in 0..h {
+        for x in 0..w {
+            let mut alpha_sum = 0u32;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let px = x as f32 + (sx as f32 + 0.5) / 4.0;
+                    let py = y as f32 + (sy as f32 + 0.5) / 4.0;
+                    let dx = px - 18.0;
+                    let dy = py - 18.0;
+                    let dist = dx.hypot(dy);
+                    let angle = (dy.atan2(dx) + std::f32::consts::FRAC_PI_2).rem_euclid(tau);
+                    let track = (dist - radius).abs() < 0.75;
+                    let arc = connected
+                        && level > 0.0
+                        && (dist - radius).abs() < 2.25
+                        && (angle <= progress_angle
+                            || dx.hypot(dy + radius) < 2.25
+                            || (px - end_x).hypot(py - end_y) < 2.25);
+                    let slash = !connected && (px - py).abs() < 1.25 && dist < radius - 2.2;
+                    let bolt = charging
+                        && point_in_polygon(
+                            px,
+                            py,
+                            &[
+                                (18.5, 9.8),
+                                (13.8, 18.2),
+                                (17.2, 18.2),
+                                (15.7, 26.1),
+                                (22.4, 16.1),
+                                (18.8, 16.1),
+                            ],
+                        );
+                    let alpha = if arc || slash || bolt {
+                        255u32
+                    } else if track {
+                        68u32
+                    } else {
+                        0
+                    };
+                    alpha_sum += alpha;
+                }
+            }
+            let i = ((y * w + x) * 4) as usize;
+            rgba[i + 3] = (alpha_sum / 16).min(255) as u8;
+        }
+    }
+    Ok(Icon::from_rgba(rgba, w, h)?)
+}
+
+fn publish_connected(
+    state: &Arc<Mutex<State>>,
+    desc: String,
+    battery: BatteryInfo,
+    dpi: Option<u16>,
+    mode: OnboardMode,
+) {
+    if let Ok(mut st) = state.lock() {
+        st.snap.device_desc = Some(desc);
+        st.snap.battery = Some(battery);
+        st.snap.dpi = dpi;
+        st.snap.mode = Some(mode);
+        st.snap.error = None;
+        st.dirty = true;
+    }
+}
+
+fn publish_battery(state: &Arc<Mutex<State>>, desc: String, battery: BatteryInfo) {
+    if let Ok(mut st) = state.lock() {
+        st.snap.device_desc = Some(desc);
+        st.snap.battery = Some(battery);
+        st.snap.error = None;
+        st.dirty = true;
+    }
+}
+
+fn publish_offline(state: &Arc<Mutex<State>>, error: String) {
+    if let Ok(mut st) = state.lock() {
+        st.snap.device_desc = None;
+        st.snap.battery = None;
+        st.snap.dpi = None;
+        st.snap.mode = None;
+        st.snap.error = Some(error);
+        st.dirty = true;
+    }
+}
+
+fn wait_with_interface_watch(dev: &G502Device, seconds: u64) -> bool {
+    let mut remaining = seconds;
+    while remaining > 0 {
+        let step = remaining.min(2);
+        std::thread::sleep(Duration::from_secs(step));
+        remaining -= step;
+        if matches!(connection_interface_unchanged(dev), Ok(false)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// 电量轮询线程：新连接时恢复模式/DPI，稳定连接时只读取电池。
+fn poll_loop(state: Arc<Mutex<State>>) {
+    let mut active: Option<Arc<G502Device>> = None;
+    let mut desc = String::new();
+    loop {
+        let cfg = config::load().unwrap_or_default();
+        let next_delay;
+
+        if let Some(dev) = active.clone() {
+            match read_battery(&dev) {
+                Ok(battery) => {
+                    next_delay = 5;
+                    publish_battery(&state, desc.clone(), battery);
+                }
+                Err(e) => {
+                    active = None;
+                    let present = g502_interface_present().unwrap_or(true);
+                    next_delay = if present { 10 } else { 2 };
+                    publish_offline(&state, e.to_string());
+                }
+            }
+        } else {
+            match crate::device::get_conn(0).and_then(|dev| {
+                let applied = controller::apply_desired_state(&dev, &cfg)?;
+                if cfg.desired_dpi.is_none() && applied.mode == OnboardMode::Host {
+                    if let Some(current_dpi) = applied.dpi {
+                        let mut migrated = cfg.clone();
+                        migrated.desired_dpi = Some(current_dpi);
+                        let _ = config::save(&migrated);
+                    }
+                }
+                let device_desc = crate::device::describe(&dev);
+                let battery = read_battery(&dev)?;
+                Ok((dev, device_desc, battery, applied))
+            }) {
+                Ok((dev, device_desc, battery, applied)) => {
+                    next_delay = 5;
+                    desc = device_desc;
+                    publish_connected(&state, desc.clone(), battery, applied.dpi, applied.mode);
+                    active = Some(dev);
+                }
+                Err(e) => {
+                    let present = g502_interface_present().unwrap_or(true);
+                    next_delay = if present { 10 } else { 2 };
+                    publish_offline(&state, e.to_string());
+                }
+            }
+        }
+
+        if let Some(dev) = active.clone() {
+            if !wait_with_interface_watch(&dev, next_delay) {
+                active = None;
+                invalidate_connection();
+                publish_offline(&state, "G502 USB 连接已变化，正在重新连接".into());
+            }
+        } else {
+            std::thread::sleep(Duration::from_secs(next_delay));
+        }
+    }
+}
+
+pub fn run() -> Result<()> {
+    let Some(mtm) = MainThreadMarker::new() else {
+        anyhow::bail!("menubar 必须在主线程运行");
+    };
+    // HidApi 必须在主线程初始化(见 hidpp.rs 注释)
+    crate::hidpp::init_shared_api()?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+
+    let cfg = config::load()?;
+    let state = Arc::new(Mutex::new(State {
+        snap: Snapshot::default(),
+        dirty: false,
+    }));
+    let tap = Arc::new(MacroTap::new(Arc::new(|| {
+        config::load().map(|c| c.macros).unwrap_or_default()
+    })));
+    if cfg.macros.values().any(|m| m.enabled) {
+        let granted = accessibility_granted(false);
+        crate::macro_engine::mlog(&format!(
+            "menubar 启动:有启用宏,accessibility_granted={granted},尝试启动 tap"
+        ));
+        if granted {
+            if let Err(e) = tap.start() {
+                crate::macro_engine::mlog(&format!("menubar 启动:tap 启动失败: {e}"));
+            }
+        } else {
+            // 以最终签名 Bundle 的身份触发系统授权引导；旧的裸二进制/zcode 授权不再复用。
+            accessibility_granted(true);
+            crate::macro_engine::mlog("menubar 启动:已请求 g502hub.app 辅助功能权限");
+            // 用户在系统设置中勾选后自动启动，不要求再点一次菜单。
+            let tap_after_permission = tap.clone();
+            std::thread::spawn(move || {
+                for _ in 0..120 {
+                    std::thread::sleep(Duration::from_secs(2));
+                    if accessibility_granted(false) {
+                        match tap_after_permission.start() {
+                            Ok(()) => crate::macro_engine::mlog("辅助功能授权已生效,tap 自动启动"),
+                            Err(e) => {
+                                crate::macro_engine::mlog(&format!("授权后 tap 启动失败: {e}"))
+                            }
+                        }
+                        break;
+                    }
+                }
+            });
+        }
+    } else {
+        crate::macro_engine::mlog("menubar 启动:无启用宏,tap 未启动");
+    }
+
+    // 动作工作线程:菜单事件 → 后台执行设备操作,主线程永不阻塞
+    let core = Arc::new(Core {
+        state: state.clone(),
+        tap: tap.clone(),
+        cfg: cfg.clone(),
+    });
+    let (tx, rx) = mpsc::channel::<String>();
+    let _ = ACTION_TX.set(tx);
+    {
+        let core = core.clone();
+        std::thread::spawn(move || {
+            while let Ok(id) = rx.recv() {
+                core.handle(&id);
+                if QUIT.load(Ordering::Relaxed) {
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
+
+    let initial_snap = Snapshot::default();
+    let icon = make_icon(&initial_snap)?;
+    let tray = TrayIconBuilder::new()
+        .with_menu(Box::new(Menu::new()))
+        .with_icon(icon)
+        .with_icon_as_template(true)
+        .with_tooltip("G502 LIGHTSPEED")
+        .build()?;
+    tray.set_title::<&str>(None);
+
+    let mut app = App {
+        state: state.clone(),
+        tray,
+        tap: tap.clone(),
+        cfg: cfg.clone(),
+        header: MenuItem::with_id("noop", "", false, None),
+        battery_line: MenuItem::with_id("noop", "", false, None),
+        mode_line: MenuItem::with_id("noop", "", false, None),
+        mode_action: MenuItem::with_id("mode:toggle", "", false, None),
+        dpi_items: Vec::new(),
+        macro_status: MenuItem::with_id("noop", "", false, None),
+        macro_g4: MenuItem::with_id("noop", "", false, None),
+        macro_g5: MenuItem::with_id("noop", "", false, None),
+        macro_record_shortcut: MenuItem::with_id("macro:record-shortcut", "", true, None),
+        macro_record_sequence: MenuItem::with_id("macro:record-sequence", "", true, None),
+        macro_finish_recording: MenuItem::with_id("macro:finish-recording", "", false, None),
+        macro_cancel_recording: MenuItem::with_id("macro:cancel-recording", "", false, None),
+        macro_toggle: MenuItem::with_id("macro:toggle", "", true, None),
+        last_recording_serial: recording_serial(),
+        ghub_item: MenuItem::with_id("ghub:quit", "", false, None),
+    };
+    app.build_menu()?;
+    {
+        let snap = state.lock().unwrap().snap.clone();
+        app.refresh_menu(&snap);
+    }
+
+    let poll_state = state.clone();
+    std::thread::spawn(move || poll_loop(poll_state));
+
+    // CFRunLoopTimer:主线程 0.2s 泵一次,经 context 携带 App 指针
+    let app_ptr = &mut app as *mut App;
+    let mut ctx = CFRunLoopTimerContext {
+        version: 0,
+        info: app_ptr as *mut std::ffi::c_void,
+        retain: None,
+        release: None,
+        copyDescription: None,
+    };
+    let timer: CFRunLoopTimerRef = unsafe {
+        CFRunLoopTimerCreate(
+            std::ptr::null(),
+            CFAbsoluteTimeGetCurrent() + 0.2,
+            0.2,
+            0,
+            0,
+            pump_callback,
+            &mut ctx,
+        )
+    };
+    unsafe {
+        CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+        let ns_app = NSApplication::sharedApplication(mtm);
+        ns_app.finishLaunching();
+        ns_app.run();
+    }
+    Ok(())
+}
+
+extern "C" fn pump_callback(_timer: CFRunLoopTimerRef, info: *mut std::ffi::c_void) {
+    if info.is_null() {
+        return;
+    }
+    let app = unsafe { &mut *(info as *mut App) };
+
+    app.tap.expire_recording();
+    if recording_outcome_pending() {
+        if let Some(tx) = ACTION_TX.get() {
+            let _ = tx.send("macro:poll-recording".into());
+        }
+    }
+    let serial = recording_serial();
+    let recording_changed = serial != app.last_recording_serial;
+    if recording_changed {
+        app.last_recording_serial = serial;
+    }
+
+    // 1. 菜单事件 → 转发到工作线程(主线程不执行设备操作)
+    let receiver = MenuEvent::receiver();
+    while let Ok(ev) = receiver.try_recv() {
+        let id = ev.id().0.clone();
+        if let Some(tx) = ACTION_TX.get() {
+            let _ = tx.send(id);
+        }
+    }
+
+    // 2. 状态变化 → 快照后原地刷新(不持锁渲染)
+    let snap = {
+        let mut st = match app.state.try_lock() {
+            Ok(st) => st,
+            Err(_) => return, // 轮询线程正持有锁,下个 0.2s 周期再来
+        };
+        if st.dirty || recording_changed {
+            st.dirty = false;
+            Some(st.snap.clone())
+        } else {
+            None
+        }
+    };
+    if let Some(snap) = snap {
+        app.tray.set_title::<&str>(None);
+        if let Ok(icon) = make_icon(&snap) {
+            let _ = app.tray.set_icon_with_as_template(Some(icon), true);
+        }
+        app.refresh_menu(&snap);
+    }
+}

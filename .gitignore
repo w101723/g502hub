@@ -1,0 +1,8 @@
+# macOS
+.DS_Store
+
+# Rust 构建产物
+rust/target/
+
+# 安装脚本生成的应用包(可用 scripts/install.sh 重建)
+g502hub.app/
