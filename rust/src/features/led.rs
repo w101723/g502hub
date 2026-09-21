@@ -160,9 +160,14 @@ impl<'a> Led<'a> {
     }
 
     /// 变色循环:[zone, 2, 0x0003, 强度, 饱和度, 周期(2B 大端 ms)]。
-    /// period_ms = 0 时使用设备默认节奏(仅发默认强度/饱和度)。
     pub fn set_cycle(&self, zone: u8, period_ms: u16, brightness: u8) -> Result<(), HidppError> {
         let intensity = intensity_byte(brightness);
+        // 真机实测:周期 0 不渲染,0(即"默认速率")以 2000ms 下发
+        let period = if period_ms == 0 {
+            RATE_MEDIUM_MS
+        } else {
+            period_ms
+        };
         let params: [u8; 16] = [
             zone,
             SLOT_CYCLE,
@@ -170,8 +175,8 @@ impl<'a> Led<'a> {
             0x03,
             intensity,
             0xFF,
-            (period_ms >> 8) as u8,
-            period_ms as u8,
+            (period >> 8) as u8,
+            period as u8,
             0,
             0,
             0,
@@ -193,6 +198,12 @@ impl<'a> Led<'a> {
         brightness: u8,
     ) -> Result<(), HidppError> {
         let intensity = intensity_byte(brightness);
+        // 真机实测:周期 0 不渲染,0(即"默认速率")以 2000ms 下发
+        let period = if period_ms == 0 {
+            RATE_MEDIUM_MS
+        } else {
+            period_ms
+        };
         let params: [u8; 16] = [
             zone,
             SLOT_BREATHING,
@@ -201,8 +212,8 @@ impl<'a> Led<'a> {
             rgb[0],
             rgb[1],
             rgb[2],
-            (period_ms >> 8) as u8,
-            period_ms as u8,
+            (period >> 8) as u8,
+            period as u8,
             intensity,
             0,
             0,

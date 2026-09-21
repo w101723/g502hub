@@ -38,6 +38,20 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 static QUIT: AtomicBool = AtomicBool::new(false);
 static ACTION_TX: std::sync::OnceLock<mpsc::Sender<String>> = std::sync::OnceLock::new();
 
+/// 菜单预设色(任意颜色走"自定义颜色…"调起系统取色器)。
+const LED_COLORS: &[(&str, &str)] = &[
+    ("白", "ffffff"),
+    ("红", "ff0000"),
+    ("橙", "ff6600"),
+    ("黄", "ffcc00"),
+    ("绿", "00dd00"),
+    ("青", "00c8ff"),
+    ("蓝", "2244ff"),
+    ("紫", "aa00ff"),
+    ("品红", "ff0082"),
+    ("粉", "ff69b4"),
+];
+
 // ---------------------------------------------------------------------- //
 #[derive(Default, Clone)]
 struct Snapshot {
@@ -126,15 +140,37 @@ impl App {
         self.led_bright_items.clear();
         for (zone_key, zone_label) in [("primary", "主要"), ("logo", "标志")] {
             let zone_menu = Submenu::new(zone_label, true);
-            for (label, id) in [
-                ("关闭", format!("led:{zone_key}:off")),
-                ("固定:白", format!("led:{zone_key}:solid:ffffff")),
-                ("固定:品红", format!("led:{zone_key}:solid:ff0082")),
-                ("固定:青", format!("led:{zone_key}:solid:00c8ff")),
-                ("呼吸", format!("led:{zone_key}:breathing")),
-                ("循环", format!("led:{zone_key}:cycle")),
-            ] {
-                let _ = zone_menu.append(&MenuItem::with_id(id, label, true, None));
+            let _ = zone_menu.append(&MenuItem::with_id(
+                format!("led:{zone_key}:off"),
+                "关闭",
+                true,
+                None,
+            ));
+            let _ = zone_menu.append(&MenuItem::with_id(
+                format!("led:{zone_key}:cycle"),
+                "循环",
+                true,
+                None,
+            ));
+            let _ = zone_menu.append(&PredefinedMenuItem::separator());
+            for (effect, label) in [("solid", "固定色"), ("breathing", "呼吸")] {
+                let color_sub = Submenu::new(label, true);
+                for (name, hex) in LED_COLORS {
+                    let _ = color_sub.append(&MenuItem::with_id(
+                        format!("led:{zone_key}:{effect}:{hex}"),
+                        name,
+                        true,
+                        None,
+                    ));
+                }
+                let _ = color_sub.append(&PredefinedMenuItem::separator());
+                let _ = color_sub.append(&MenuItem::with_id(
+                    format!("led:{zone_key}:custom:{effect}"),
+                    "自定义颜色…",
+                    true,
+                    None,
+                ));
+                let _ = zone_menu.append(&color_sub);
             }
             let _ = zone_menu.append(&PredefinedMenuItem::separator());
             let rate_sub = Submenu::new("速率", true);
@@ -418,7 +454,7 @@ impl Core {
         }
     }
 
-    fn handle_led_menu(&self, arg: &str) {
+    fn handle_led_menu(self: &Arc<Self>, arg: &str) {
         let segs: Vec<&str> = arg.split(':').collect();
         let Some(zone) = segs
             .first()
@@ -440,7 +476,18 @@ impl Core {
                 spec.rgb = hex_rgb(hex);
                 spec.effect = "solid".into();
                 spec.off = false;
-                spec.brightness = if *hex == "ffffff" { 100 } else { 80 };
+            }
+            ["breathing", hex] => {
+                spec.rgb = hex_rgb(hex);
+                spec.effect = "breathing".into();
+                spec.off = false;
+            }
+            ["custom", effect] => {
+                let effect = (*effect).to_string();
+                let core = Arc::clone(self);
+                // 取色器对话框会阻塞到用户确认,放到独立线程,不卡菜单轮询
+                std::thread::spawn(move || core.pick_custom_color(zone, &effect));
+                return;
             }
             [effect] => {
                 spec.effect = (*effect).into();
@@ -483,6 +530,84 @@ impl Core {
                 self.notify(&format!(
                     "{} 灯效已更新: {summary}",
                     crate::features::led::zone_label(zone)
+                ));
+            }
+            Err(e) => self.notify(&format!("灯效失败: {e}")),
+        }
+        if let Ok(mut st) = self.state.lock() {
+            st.dirty = true;
+        }
+    }
+
+    /// 弹出 macOS 系统取色器(阻塞在独立线程),选定后应用并保存。
+    fn pick_custom_color(self: &Arc<Self>, zone: u8, effect: &str) {
+        let key = crate::features::led::zone_key(zone);
+        let default_rgb = config::load()
+            .ok()
+            .and_then(|cfg| cfg.led_zones.get(key).cloned())
+            .map(|s| s.rgb)
+            .unwrap_or([255, 255, 255]);
+        let to65k = |c: u8| (c as u16) * 257;
+        let script = format!(
+            "choose color default color {{{}, {}, {}}}",
+            to65k(default_rgb[0]),
+            to65k(default_rgb[1]),
+            to65k(default_rgb[2])
+        );
+        let Ok(out) = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+        else {
+            self.notify("无法打开系统取色器");
+            return;
+        };
+        if !out.status.success() {
+            return; // 用户取消
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let nums: Vec<u16> = text
+            .trim()
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .split(',')
+            .filter_map(|p| p.trim().parse().ok())
+            .collect();
+        if nums.len() != 3 {
+            self.notify("取色结果解析失败");
+            return;
+        }
+        let rgb = [
+            (nums[0] / 257) as u8,
+            (nums[1] / 257) as u8,
+            (nums[2] / 257) as u8,
+        ];
+        let mut spec = config::load()
+            .ok()
+            .and_then(|cfg| cfg.led_zones.get(key).cloned())
+            .unwrap_or_else(|| config::LedSpec::new(effect, rgb, 100, Some("medium")));
+        spec.effect = effect.to_string();
+        spec.rgb = rgb;
+        spec.off = false;
+        let period = crate::features::led::rate_period_ms(spec.rate.as_deref()).unwrap_or(0);
+        let r = crate::device::get_conn(1).and_then(|dev| {
+            let l = Led::new(&dev)?;
+            l.set_effect(zone, &spec.effect, spec.rgb, spec.brightness, period)
+        });
+        match r {
+            Ok(()) => {
+                if let Ok(mut cfg) = config::load() {
+                    cfg.led_zones.insert(key.to_string(), spec.clone());
+                    let _ = config::save(&cfg);
+                }
+                self.notify(&format!(
+                    "{} 灯效已更新: {} #{:02x}{:02x}{:02x} 亮度{}%",
+                    crate::features::led::zone_label(zone),
+                    spec.effect,
+                    rgb[0],
+                    rgb[1],
+                    rgb[2],
+                    spec.brightness
                 ));
             }
             Err(e) => self.notify(&format!("灯效失败: {e}")),
