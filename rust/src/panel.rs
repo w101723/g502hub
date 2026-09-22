@@ -115,6 +115,54 @@ declare_class!(
             }
         }
 
+        #[method(onToggleMacroEngine:)]
+        fn on_toggle_macro_engine(&self, _sender: Option<&NSButton>) {
+            crate::menubar::dispatch_menu_action("macro:toggle");
+            PopoverPanel::sync_macro_ui();
+        }
+
+        #[method(onRecordG4:)]
+        fn on_record_g4(&self, _sender: Option<&NSButton>) {
+            crate::menubar::dispatch_menu_action("macro:record-g4");
+            PopoverPanel::sync_macro_ui();
+        }
+
+        #[method(onRecordG5:)]
+        fn on_record_g5(&self, _sender: Option<&NSButton>) {
+            crate::menubar::dispatch_menu_action("macro:record-g5");
+            PopoverPanel::sync_macro_ui();
+        }
+
+        #[method(onClearG4:)]
+        fn on_clear_g4(&self, _sender: Option<&NSButton>) {
+            crate::menubar::dispatch_menu_action("macro:clear-g4");
+            PopoverPanel::sync_macro_ui();
+        }
+
+        #[method(onClearG5:)]
+        fn on_clear_g5(&self, _sender: Option<&NSButton>) {
+            crate::menubar::dispatch_menu_action("macro:clear-g5");
+            PopoverPanel::sync_macro_ui();
+        }
+
+        #[method(onRecordSequence:)]
+        fn on_record_sequence(&self, _sender: Option<&NSButton>) {
+            crate::menubar::dispatch_menu_action("macro:record-sequence");
+            PopoverPanel::sync_macro_ui();
+        }
+
+        #[method(onFinishRecording:)]
+        fn on_finish_recording(&self, _sender: Option<&NSButton>) {
+            crate::menubar::dispatch_menu_action("macro:finish-recording");
+            PopoverPanel::sync_macro_ui();
+        }
+
+        #[method(onCancelRecording:)]
+        fn on_cancel_recording(&self, _sender: Option<&NSButton>) {
+            crate::menubar::dispatch_menu_action("macro:cancel-recording");
+            PopoverPanel::sync_macro_ui();
+        }
+
         #[method(onWindowResignKey:)]
         fn on_window_resign_key(&self, _notification: Option<&NSNotification>) {
             PopoverPanel::shared_hide();
@@ -139,6 +187,17 @@ struct PanelHolder {
     rate_slider: Retained<NSSlider>,
     rate_label: Retained<NSTextField>,
     active_rgb: Cell<[u8; 3]>,
+    macro_toggle_btn: Retained<NSButton>,
+    macro_g4_binding: Retained<NSTextField>,
+    macro_g4_record_btn: Retained<NSButton>,
+    macro_g4_clear_btn: Retained<NSButton>,
+    macro_g5_binding: Retained<NSTextField>,
+    macro_g5_record_btn: Retained<NSButton>,
+    macro_g5_clear_btn: Retained<NSButton>,
+    macro_status_label: Retained<NSTextField>,
+    macro_rec_seq_btn: Retained<NSButton>,
+    macro_rec_finish_btn: Retained<NSButton>,
+    macro_rec_cancel_btn: Retained<NSButton>,
     _dispatcher: Retained<PanelDispatcher>,
 }
 
@@ -168,7 +227,7 @@ impl PopoverPanel {
 
     pub fn init(mtm: MainThreadMarker) {
         let panel_width = 330.0;
-        let panel_height = 550.0;
+        let panel_height = 680.0;
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(panel_width, panel_height));
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::FullSizeContentView
@@ -224,7 +283,7 @@ impl PopoverPanel {
         let root_stack = unsafe { NSStackView::new(mtm) };
         unsafe {
             root_stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
-            root_stack.setSpacing(12.0);
+            root_stack.setSpacing(10.0);
             root_stack.setEdgeInsets(NSEdgeInsets {
                 top: 16.0,
                 left: 16.0,
@@ -506,6 +565,175 @@ impl PopoverPanel {
             root_stack.addArrangedSubview(&rate_row);
         }
 
+        // 8. 侧键宏设置卡片
+        unsafe {
+            root_stack.addArrangedSubview(&Self::create_separator(mtm));
+        }
+
+        let macro_header_row = unsafe { NSStackView::new(mtm) };
+        unsafe {
+            macro_header_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+            macro_header_row.setSpacing(8.0);
+        }
+        let macro_title = unsafe { NSTextField::labelWithString(&NSString::from_str("侧键宏"), mtm) };
+        unsafe {
+            macro_title.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
+            macro_header_row.addArrangedSubview(&macro_title);
+        }
+        let macro_toggle_btn = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("● 宏引擎已开启"),
+                Some(&dispatcher),
+                Some(sel!(onToggleMacroEngine:)),
+                mtm,
+            )
+        };
+        unsafe {
+            macro_toggle_btn.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            macro_header_row.addArrangedSubview(&macro_toggle_btn);
+            root_stack.addArrangedSubview(&macro_header_row);
+        }
+
+        // G4 (后退) 行
+        let g4_row = unsafe { NSStackView::new(mtm) };
+        unsafe {
+            g4_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+            g4_row.setSpacing(6.0);
+        }
+        let g4_name = unsafe { NSTextField::labelWithString(&NSString::from_str("G4 (后退):"), mtm) };
+        unsafe {
+            g4_name.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            g4_row.addArrangedSubview(&g4_name);
+        }
+        let macro_g4_binding = unsafe { NSTextField::labelWithString(&NSString::from_str("未绑定"), mtm) };
+        unsafe {
+            macro_g4_binding.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
+            macro_g4_binding.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            g4_row.addArrangedSubview(&macro_g4_binding);
+        }
+        let macro_g4_record_btn = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("录制"),
+                Some(&dispatcher),
+                Some(sel!(onRecordG4:)),
+                mtm,
+            )
+        };
+        unsafe {
+            macro_g4_record_btn.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            g4_row.addArrangedSubview(&macro_g4_record_btn);
+        }
+        let macro_g4_clear_btn = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("清空"),
+                Some(&dispatcher),
+                Some(sel!(onClearG4:)),
+                mtm,
+            )
+        };
+        unsafe {
+            macro_g4_clear_btn.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            g4_row.addArrangedSubview(&macro_g4_clear_btn);
+            root_stack.addArrangedSubview(&g4_row);
+        }
+
+        // G5 (前进) 行
+        let g5_row = unsafe { NSStackView::new(mtm) };
+        unsafe {
+            g5_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+            g5_row.setSpacing(6.0);
+        }
+        let g5_name = unsafe { NSTextField::labelWithString(&NSString::from_str("G5 (前进):"), mtm) };
+        unsafe {
+            g5_name.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            g5_row.addArrangedSubview(&g5_name);
+        }
+        let macro_g5_binding = unsafe { NSTextField::labelWithString(&NSString::from_str("未绑定"), mtm) };
+        unsafe {
+            macro_g5_binding.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
+            macro_g5_binding.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            g5_row.addArrangedSubview(&macro_g5_binding);
+        }
+        let macro_g5_record_btn = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("录制"),
+                Some(&dispatcher),
+                Some(sel!(onRecordG5:)),
+                mtm,
+            )
+        };
+        unsafe {
+            macro_g5_record_btn.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            g5_row.addArrangedSubview(&macro_g5_record_btn);
+        }
+        let macro_g5_clear_btn = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("清空"),
+                Some(&dispatcher),
+                Some(sel!(onClearG5:)),
+                mtm,
+            )
+        };
+        unsafe {
+            macro_g5_clear_btn.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            g5_row.addArrangedSubview(&macro_g5_clear_btn);
+            root_stack.addArrangedSubview(&g5_row);
+        }
+
+        // 宏状态提示
+        let macro_status_label = unsafe {
+            NSTextField::labelWithString(&NSString::from_str("● 宏引擎就绪"), mtm)
+        };
+        unsafe {
+            macro_status_label.setFont(Some(&NSFont::systemFontOfSize(10.5)));
+            macro_status_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            root_stack.addArrangedSubview(&macro_status_label);
+        }
+
+        // 宏录制辅助控制条
+        let macro_action_row = unsafe { NSStackView::new(mtm) };
+        unsafe {
+            macro_action_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+            macro_action_row.setSpacing(6.0);
+        }
+        let macro_rec_seq_btn = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("按键序列"),
+                Some(&dispatcher),
+                Some(sel!(onRecordSequence:)),
+                mtm,
+            )
+        };
+        unsafe {
+            macro_rec_seq_btn.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            macro_action_row.addArrangedSubview(&macro_rec_seq_btn);
+        }
+        let macro_rec_finish_btn = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("完成保存"),
+                Some(&dispatcher),
+                Some(sel!(onFinishRecording:)),
+                mtm,
+            )
+        };
+        unsafe {
+            macro_rec_finish_btn.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            macro_action_row.addArrangedSubview(&macro_rec_finish_btn);
+        }
+        let macro_rec_cancel_btn = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str("取消录制"),
+                Some(&dispatcher),
+                Some(sel!(onCancelRecording:)),
+                mtm,
+            )
+        };
+        unsafe {
+            macro_rec_cancel_btn.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            macro_action_row.addArrangedSubview(&macro_rec_cancel_btn);
+            root_stack.addArrangedSubview(&macro_action_row);
+        }
+
         // 注册窗口失焦通知
         unsafe {
             let center = NSNotificationCenter::defaultCenter();
@@ -534,6 +762,17 @@ impl PopoverPanel {
             rate_slider,
             rate_label,
             active_rgb: Cell::new([0, 200, 255]),
+            macro_toggle_btn,
+            macro_g4_binding,
+            macro_g4_record_btn,
+            macro_g4_clear_btn,
+            macro_g5_binding,
+            macro_g5_record_btn,
+            macro_g5_clear_btn,
+            macro_status_label,
+            macro_rec_seq_btn,
+            macro_rec_finish_btn,
+            macro_rec_cancel_btn,
             _dispatcher: dispatcher,
         };
 
@@ -947,6 +1186,7 @@ impl PopoverPanel {
                 }
             }
         });
+        Self::sync_macro_ui();
     }
 
     pub fn sync_ui_from_config() {
@@ -1005,6 +1245,98 @@ impl PopoverPanel {
                     h.rate_slider.setDoubleValue(period as f64);
                     h.rate_slider.setEnabled(effect_idx == 2 || effect_idx == 3);
                     h.rate_label.setStringValue(&NSString::from_str(&Self::format_rate_label(period, effect_idx)));
+                }
+            }
+        });
+        Self::sync_macro_ui();
+    }
+
+    pub fn sync_macro_ui() {
+        HOLDER.with(|cell| {
+            if let Some(h) = cell.borrow().as_ref() {
+                let running = crate::macro_engine::is_tap_running();
+                let phase = crate::macro_engine::recording_phase();
+                let cfg = crate::config::load().unwrap_or_default();
+
+                let g4_binding = cfg.macros.get("mouse3");
+                let g5_binding = cfg.macros.get("mouse4");
+
+                unsafe {
+                    if running {
+                        h.macro_toggle_btn.setTitle(&NSString::from_str("● 宏引擎已开启"));
+                    } else {
+                        h.macro_toggle_btn.setTitle(&NSString::from_str("○ 宏引擎已停用"));
+                    }
+
+                    let g4_summary = g4_binding
+                        .map(crate::macro_engine::format_binding_summary)
+                        .unwrap_or_else(|| "未绑定 (默认后退)".to_string());
+                    h.macro_g4_binding.setStringValue(&NSString::from_str(&g4_summary));
+                    if g4_binding.is_some() {
+                        h.macro_g4_binding.setTextColor(Some(&NSColor::systemBlueColor()));
+                    } else {
+                        h.macro_g4_binding.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                    }
+                    h.macro_g4_clear_btn.setEnabled(g4_binding.is_some());
+
+                    let g5_summary = g5_binding
+                        .map(crate::macro_engine::format_binding_summary)
+                        .unwrap_or_else(|| "未绑定 (默认前进)".to_string());
+                    h.macro_g5_binding.setStringValue(&NSString::from_str(&g5_summary));
+                    if g5_binding.is_some() {
+                        h.macro_g5_binding.setTextColor(Some(&NSColor::systemBlueColor()));
+                    } else {
+                        h.macro_g5_binding.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                    }
+                    h.macro_g5_clear_btn.setEnabled(g5_binding.is_some());
+
+                    let is_recording = !matches!(phase, crate::macro_engine::RecordingPhase::Idle);
+                    h.macro_g4_record_btn.setEnabled(!is_recording);
+                    h.macro_g5_record_btn.setEnabled(!is_recording);
+                    h.macro_rec_seq_btn.setEnabled(!is_recording);
+                    h.macro_rec_cancel_btn.setEnabled(is_recording);
+
+                    let is_sequence = matches!(phase, crate::macro_engine::RecordingPhase::Sequence { .. });
+                    h.macro_rec_finish_btn.setEnabled(is_sequence);
+
+                    let (status_text, is_warn) = match &phase {
+                        crate::macro_engine::RecordingPhase::Idle => {
+                            if running {
+                                ("● 宏引擎就绪 (按 G4/G5 侧键触发)".to_string(), false)
+                            } else {
+                                ("○ 宏引擎已停用 (点击开启以启用侧键拦截)".to_string(), false)
+                            }
+                        }
+                        crate::macro_engine::RecordingPhase::AwaitMouse(crate::macro_engine::RecordingKind::Shortcut) => {
+                            ("👉 请按目标侧键 (G4 或 G5)...".to_string(), true)
+                        }
+                        crate::macro_engine::RecordingPhase::AwaitMouse(crate::macro_engine::RecordingKind::Sequence) => {
+                            ("👉 请按目标侧键开始录制序列...".to_string(), true)
+                        }
+                        crate::macro_engine::RecordingPhase::Shortcut { button } => {
+                            let name = match button {
+                                3 => "G4(后退)",
+                                4 => "G5(前进)",
+                                _ => "侧键",
+                            };
+                            (format!("⌨️ 正在录制 {name}: 请按一次键盘快捷键..."), true)
+                        }
+                        crate::macro_engine::RecordingPhase::Sequence { button, events } => {
+                            let name = match button {
+                                3 => "G4(后退)",
+                                4 => "G5(前进)",
+                                _ => "侧键",
+                            };
+                            (format!("🔴 录制中 {name}: 已捕获 {events} 个按键事件"), true)
+                        }
+                    };
+
+                    h.macro_status_label.setStringValue(&NSString::from_str(&status_text));
+                    if is_warn {
+                        h.macro_status_label.setTextColor(Some(&NSColor::systemOrangeColor()));
+                    } else {
+                        h.macro_status_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                    }
                 }
             }
         });

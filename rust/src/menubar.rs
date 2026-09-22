@@ -38,6 +38,12 @@ use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 static QUIT: AtomicBool = AtomicBool::new(false);
 static ACTION_TX: std::sync::OnceLock<mpsc::Sender<String>> = std::sync::OnceLock::new();
 
+pub fn dispatch_menu_action(id: &str) {
+    if let Some(tx) = ACTION_TX.get() {
+        let _ = tx.send(id.to_string());
+    }
+}
+
 /// 菜单预设色(任意颜色走"自定义颜色…"调起系统取色器)。
 pub const LED_COLORS: &[(&str, &str)] = &[
     ("白", "ffffff"),
@@ -252,9 +258,10 @@ impl App {
                     .voltage_mv
                     .map(|v| format!(" · {v}mV"))
                     .unwrap_or_default();
+                let icon = if b.charging { "⚡️" } else { "🔋" };
                 self.header.set_text(desc.clone());
                 self.battery_line
-                    .set_text(format!("🔋{}% {}{volt}", b.percent, b.state_text));
+                    .set_text(format!("{icon} {}% {}{volt}", b.percent, b.state_text));
             }
             (Some(desc), None) => {
                 self.header.set_text(desc.clone());
@@ -291,7 +298,11 @@ impl App {
         let battery_str = snap
             .battery
             .as_ref()
-            .map(|b| format!("🔋{}% {}{}", b.percent, b.state_text, b.voltage_mv.map(|v| format!(" · {v}mV")).unwrap_or_default()))
+            .map(|b| {
+                let icon = if b.charging { "⚡️" } else { "🔋" };
+                let volt = b.voltage_mv.map(|v| format!(" · {v}mV")).unwrap_or_default();
+                format!("{icon} {}% {}{volt}", b.percent, b.state_text)
+            })
             .unwrap_or_else(|| "🔋 未连接".into());
         let mode_str = match snap.mode {
             Some(OnboardMode::Onboard) => "控制模式: 板载控制 (固件自管)",
@@ -416,6 +427,29 @@ impl Core {
                 RecordingKind::Shortcut => "请按要绑定的鼠标侧键，然后按键盘组合",
                 RecordingKind::Sequence => "请按要绑定的鼠标侧键，然后开始键盘录制",
             }),
+            Err(e) => self.notify(&format!("开始录制失败: {e}")),
+        }
+    }
+
+    fn start_recording_for_button(&self, button: u32, kind: RecordingKind) {
+        if !accessibility_granted(false) {
+            accessibility_granted(true);
+            self.notify("请先在系统设置中允许 g502hub 辅助功能权限");
+            return;
+        }
+        if !self.tap.is_running() {
+            if let Err(e) = self.tap.start() {
+                self.notify(&format!("宏引擎启动失败: {e}"));
+                return;
+            }
+        }
+        let button_name = match button {
+            3 => "G4 (后退)",
+            4 => "G5 (前进)",
+            n => &format!("button{n}"),
+        };
+        match self.tap.begin_recording_for_button(button, kind) {
+            Ok(()) => self.notify(&format!("正在录制 {button_name}，请按一次键盘组合键")),
             Err(e) => self.notify(&format!("开始录制失败: {e}")),
         }
     }
@@ -765,6 +799,26 @@ impl Core {
             ("macro", "record-sequence") => {
                 self.start_recording(RecordingKind::Sequence);
             }
+            ("macro", "record-g4") => {
+                self.start_recording_for_button(3, RecordingKind::Shortcut);
+            }
+            ("macro", "record-g5") => {
+                self.start_recording_for_button(4, RecordingKind::Shortcut);
+            }
+            ("macro", "clear-g4") => {
+                let _ = crate::macro_engine::clear_binding("mouse3");
+                if let Ok(mut st) = self.state.lock() {
+                    st.dirty = true;
+                }
+                self.notify("已清除 G4 (后退键) 宏绑定");
+            }
+            ("macro", "clear-g5") => {
+                let _ = crate::macro_engine::clear_binding("mouse4");
+                if let Ok(mut st) = self.state.lock() {
+                    st.dirty = true;
+                }
+                self.notify("已清除 G5 (前进键) 宏绑定");
+            }
             ("macro", "finish-recording") => {
                 if let Err(e) = self.tap.finish_sequence() {
                     self.notify(&format!("结束录制失败: {e}"));
@@ -903,12 +957,12 @@ fn make_icon(snap: &Snapshot) -> Result<Icon> {
                             px,
                             py,
                             &[
-                                (18.5, 9.8),
-                                (13.8, 18.2),
-                                (17.2, 18.2),
-                                (15.7, 26.1),
-                                (22.4, 16.1),
-                                (18.8, 16.1),
+                                (18.5, 9.2),
+                                (13.5, 17.5),
+                                (16.8, 17.5),
+                                (15.5, 26.8),
+                                (22.5, 16.5),
+                                (19.2, 16.5),
                             ],
                         );
                     let alpha = if arc || slash || bolt {
@@ -1077,6 +1131,7 @@ pub fn run() -> Result<()> {
     let tap = Arc::new(MacroTap::new(Arc::new(|| {
         config::load().map(|c| c.macros).unwrap_or_default()
     })));
+    crate::macro_engine::set_global_tap(tap.clone());
     if cfg.macros.values().any(|m| m.enabled) {
         let granted = accessibility_granted(false);
         crate::macro_engine::mlog(&format!(

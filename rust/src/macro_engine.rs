@@ -601,6 +601,64 @@ pub fn update_bindings(new_bindings: BTreeMap<String, MacroBinding>) {
     }
 }
 
+static GLOBAL_TAP: std::sync::OnceLock<Arc<MacroTap>> = std::sync::OnceLock::new();
+
+pub fn set_global_tap(tap: Arc<MacroTap>) {
+    let _ = GLOBAL_TAP.set(tap);
+}
+
+pub fn global_tap() -> Option<Arc<MacroTap>> {
+    GLOBAL_TAP.get().cloned()
+}
+
+pub fn is_tap_running() -> bool {
+    global_tap().map(|t| t.is_running()).unwrap_or(false)
+}
+
+pub fn clear_binding(button_key: &str) -> Result<()> {
+    let macros = crate::config::update(|cfg| {
+        cfg.macros.remove(button_key);
+        cfg.macros.clone()
+    })?;
+    if let Some(tap) = global_tap() {
+        tap.update_bindings(macros);
+    }
+    Ok(())
+}
+
+pub fn format_binding_summary(binding: &MacroBinding) -> String {
+    if !binding.enabled {
+        let name = binding.name.as_deref().unwrap_or("未命名");
+        return format!("{name} [停用]");
+    }
+    if let Some(name) = &binding.name {
+        if !name.is_empty() {
+            return name.clone();
+        }
+    }
+    if binding.actions.is_empty() {
+        return "未配置动作".to_string();
+    }
+    let parts: Vec<String> = binding
+        .actions
+        .iter()
+        .filter_map(|a| {
+            if let Some(k) = &a.keys {
+                Some(k.clone())
+            } else if let Some(t) = &a.text {
+                Some(format!("\"{t}\""))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        format!("{} 个按键动作", binding.actions.len())
+    } else {
+        parts.join(" → ")
+    }
+}
+
 pub trait IntoBindings {
     fn into_bindings(self) -> MacroBindings;
 }
@@ -681,6 +739,35 @@ impl MacroTap {
         *state = RecordingState::AwaitMouse {
             kind,
             started: Instant::now(),
+        };
+        if let Ok(mut outcome) = RECORDING_OUTCOME.lock() {
+            *outcome = None;
+        }
+        RECORDING_SERIAL.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn begin_recording_for_button(&self, button: u32, kind: RecordingKind) -> Result<()> {
+        if !self.is_running() {
+            return Err(anyhow!("宏引擎尚未运行"));
+        }
+        let mut state = RECORDING_STATE
+            .lock()
+            .map_err(|_| anyhow!("录制状态锁已损坏"))?;
+        *state = match kind {
+            RecordingKind::Shortcut => RecordingState::Shortcut {
+                button,
+                started: Instant::now(),
+                pending: None,
+                completed: None,
+                mouse_up_pending: false,
+            },
+            RecordingKind::Sequence => RecordingState::Sequence {
+                button,
+                last_event: Instant::now(),
+                actions: Vec::new(),
+                mouse_up_pending: false,
+            },
         };
         if let Ok(mut outcome) = RECORDING_OUTCOME.lock() {
             *outcome = None;
