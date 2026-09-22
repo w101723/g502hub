@@ -226,7 +226,6 @@ fn cmd_led(
             .ok_or_else(|| anyhow::anyhow!("未知分区: {other} (primary/logo/all)"))?],
     };
     with_device(|dev| {
-        let l = Led::new(dev)?;
         if action == "get" {
             // f14 不回显 volatile 状态(真机校准),这里报告配置的期望状态
             let cfg = config::load().unwrap_or_default();
@@ -254,43 +253,61 @@ fn cmd_led(
             }
             return Ok(());
         }
-        let period = features::led::rate_period_ms(rate.as_deref())?;
-        let rgb: [u8; 3] = match color {
-            Some(c) if c.len() == 6 => [
+        let parsed_rgb: Option<[u8; 3]> = match color {
+            Some(c) if c.len() == 6 => Some([
                 u8::from_str_radix(&c[0..2], 16)?,
                 u8::from_str_radix(&c[2..4], 16)?,
                 u8::from_str_radix(&c[4..6], 16)?,
-            ],
-            _ => [255, 255, 255],
+            ]),
+            Some(_) => bail!("颜色必须是 6 位十六进制 RRGGBB"),
+            None => None,
         };
         for z in zones {
+            let key = features::led::zone_key(z).to_string();
+            let mut spec = config::load()?
+                .led_zones
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| {
+                    config::LedSpec::new("solid", [255, 255, 255], 100, Some("medium"))
+                });
             if off {
-                l.set_off(z)?;
+                spec.turn_off();
+            } else {
+                spec.turn_on();
+                spec.effect = effect.into();
+                if let Some(rgb) = parsed_rgb {
+                    spec.rgb = rgb;
+                }
+                spec.brightness = brightness;
+                if let Some(value) = rate.as_deref() {
+                    features::led::rate_period_ms(Some(value))?;
+                    spec.rate = Some(value.into());
+                }
+            }
+            controller::apply_led_spec(dev, z, &spec)?;
+            config::update(|cfg| {
+                cfg.led_zones.insert(key, spec.clone());
+            })?;
+            if spec.off {
                 println!("{} 灯效 → 关闭", features::led::zone_label(z));
             } else {
-                l.set_effect(z, effect, rgb, brightness, period)?;
+                let period = features::led::rate_period_ms(spec.rate.as_deref())?;
                 let rate_text = if period == 0 {
                     "默认".into()
                 } else {
                     format!("{period}ms")
                 };
                 println!(
-                    "{} 灯效 → {effect} #{rgb:?} 亮度{brightness}% 速率{rate_text}",
-                    features::led::zone_label(z)
+                    "{} 灯效 → {} #{:02x}{:02x}{:02x} 亮度{}% 速率{rate_text}",
+                    features::led::zone_label(z),
+                    spec.effect,
+                    spec.rgb[0],
+                    spec.rgb[1],
+                    spec.rgb[2],
+                    spec.brightness
                 );
             }
-            // 持久化到 led_zones,重连后自动恢复
-            let mut cfg = config::load()?;
-            cfg.led_zones.insert(
-                features::led::zone_key(z).into(),
-                config::LedSpec::new(
-                    if off { "off" } else { effect },
-                    rgb,
-                    if off { 0 } else { brightness },
-                    rate.as_deref(),
-                ),
-            );
-            config::save(&cfg)?;
         }
         Ok(())
     })

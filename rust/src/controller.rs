@@ -5,9 +5,11 @@
 use crate::config::{Config, DesiredMode};
 use crate::device::G502Device;
 use crate::features::dpi::Dpi;
+use crate::features::led::{self, Led};
 use crate::features::onboard::{get_onboard_mode, set_onboard_mode, OnboardMode};
 use crate::hidpp::HidppError;
 use std::sync::Mutex;
+use std::time::Duration;
 
 static DEVICE_OP: Mutex<()> = Mutex::new(());
 
@@ -49,67 +51,109 @@ pub fn set_dpi_confirmed(dev: &G502Device, dpi: u16) -> Result<u16, HidppError> 
     })
 }
 
-/// 把配置中的期望状态重放到刚上线/唤醒的设备。
-///
-/// Host 模式下 DPI 属于易失状态，必须在每次重连后重新下发；Onboard 模式下
-/// 固件配置接管，刻意不写 0x2201。
-pub fn apply_desired_state(dev: &G502Device, cfg: &Config) -> Result<AppliedState, HidppError> {
-    with_device_lock(|| {
-        let desired_mode = match cfg.desired_mode {
-            DesiredMode::Host => OnboardMode::Host,
-            DesiredMode::Onboard => OnboardMode::Onboard,
-        };
-        let current_mode = read_mode(dev)?;
-        // 旧配置没有 desired_dpi 时，在离开板载模式前先捕获用户正在使用的 DPI，
-        // 避免固件切到 Host 后回落到默认 800。
-        let target_dpi = cfg
-            .desired_dpi
-            .or_else(|| Dpi::new(dev).and_then(|d| d.get_dpi()).ok());
-        let mode = if current_mode == desired_mode {
-            current_mode
-        } else {
-            set_onboard_mode(dev, desired_mode)?
-        };
+fn apply_desired_state_inner(dev: &G502Device, cfg: &Config) -> Result<AppliedState, HidppError> {
+    let desired_mode = match cfg.desired_mode {
+        DesiredMode::Host => OnboardMode::Host,
+        DesiredMode::Onboard => OnboardMode::Onboard,
+    };
+    let current_mode = read_mode(dev)?;
+    // 旧配置没有 desired_dpi 时，在离开板载模式前先捕获用户正在使用的 DPI，
+    // 避免固件切到 Host 后回落到默认 800。
+    let target_dpi = cfg
+        .desired_dpi
+        .or_else(|| Dpi::new(dev).and_then(|d| d.get_dpi()).ok());
+    let mode = if current_mode == desired_mode {
+        current_mode
+    } else {
+        set_onboard_mode(dev, desired_mode)?
+    };
 
-        let dpi = if mode == OnboardMode::Host {
-            match target_dpi {
-                Some(target) => {
-                    let d = Dpi::new(dev)?;
-                    let current = d.get_dpi()?;
-                    Some(if current == target {
-                        current
-                    } else {
-                        d.set_dpi(target)?
-                    })
-                }
-                None => Dpi::new(dev).and_then(|d| d.get_dpi()).ok(),
+    let dpi = if mode == OnboardMode::Host {
+        match target_dpi {
+            Some(target) => {
+                let d = Dpi::new(dev)?;
+                let current = d.get_dpi()?;
+                Some(if current == target {
+                    current
+                } else {
+                    d.set_dpi(target)?
+                })
             }
-        } else {
-            Dpi::new(dev).and_then(|d| d.get_dpi()).ok()
-        };
+            None => Dpi::new(dev).and_then(|d| d.get_dpi()).ok(),
+        }
+    } else {
+        Dpi::new(dev).and_then(|d| d.get_dpi()).ok()
+    };
 
-        Ok(AppliedState { mode, dpi })
+    Ok(AppliedState { mode, dpi })
+}
+
+fn apply_led_spec_inner(
+    led: &Led<'_>,
+    zone: u8,
+    spec: &crate::config::LedSpec,
+) -> Result<(), HidppError> {
+    if spec.off {
+        led.set_off(zone)
+    } else {
+        let period = led::rate_period_ms(spec.rate.as_deref())?;
+        led.set_effect(zone, &spec.effect, spec.rgb, spec.brightness, period)
+    }
+}
+
+fn apply_desired_led_inner(dev: &G502Device, cfg: &Config) -> Result<(), HidppError> {
+    let led = Led::new(dev)?;
+    let mut wrote = false;
+    for (key, zone) in [("primary", led::ZONE_PRIMARY), ("logo", led::ZONE_LOGO)] {
+        let Some(spec) = cfg.led_zones.get(key) else {
+            continue;
+        };
+        if wrote {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        apply_led_spec_inner(&led, zone, spec)?;
+        wrote = true;
+    }
+    Ok(())
+}
+
+/// 串行应用单个分区灯效，供菜单和 CLI 使用。
+pub fn apply_led_spec(
+    dev: &G502Device,
+    zone: u8,
+    spec: &crate::config::LedSpec,
+) -> Result<(), HidppError> {
+    with_device_lock(|| {
+        let led = Led::new(dev)?;
+        apply_led_spec_inner(&led, zone, spec)
     })
 }
 
-/// 把配置中的分区灯效重放到刚上线/唤醒的设备(仅首次连接调用)。
-/// 逐分区尽力而为:单个分区失败(如旧配置含已不支持的效果)不影响其它分区。
-pub fn apply_desired_led(dev: &G502Device, cfg: &Config) {
-    let Ok(led) = crate::features::led::Led::new(dev) else {
-        return;
-    };
-    for (key, spec) in &cfg.led_zones {
-        let Some(zone) = crate::features::led::zone_from_key(key) else {
-            continue;
-        };
-        let r = if spec.off {
-            led.set_off(zone)
+/// 串行重放两个分区灯效。
+pub fn apply_desired_led(dev: &G502Device, cfg: &Config) -> Result<(), HidppError> {
+    with_device_lock(|| apply_desired_led_inner(dev, cfg))
+}
+
+/// 刚上线时在同一设备锁内恢复模式、DPI 和 RGB，避免菜单写入穿插。
+/// RGB 失败不把设备整体判为离线，返回值第二项表示灯效是否已同步。
+pub fn apply_desired_all(
+    dev: &G502Device,
+    cfg: &Config,
+) -> Result<(AppliedState, bool), HidppError> {
+    with_device_lock(|| {
+        let state = apply_desired_state_inner(dev, cfg)?;
+        let led_synced = if state.mode == OnboardMode::Host {
+            std::thread::sleep(Duration::from_millis(40));
+            match apply_desired_led_inner(dev, cfg) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("首次 RGB 恢复失败，将自动重试: {e}");
+                    false
+                }
+            }
         } else {
-            let period = crate::features::led::rate_period_ms(spec.rate.as_deref()).unwrap_or(0);
-            led.set_effect(zone, &spec.effect, spec.rgb, spec.brightness, period)
+            true
         };
-        if let Err(e) = r {
-            eprintln!("恢复分区 {key} 灯效失败: {e}");
-        }
-    }
+        Ok((state, led_synced))
+    })
 }

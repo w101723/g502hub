@@ -3,7 +3,11 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+static CONFIG_OP: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LedSpec {
@@ -28,6 +32,18 @@ impl LedSpec {
             rgb,
             brightness,
             rate: rate.map(|r| r.into()),
+        }
+    }
+
+    pub fn turn_off(&mut self) {
+        self.off = true;
+    }
+
+    pub fn turn_on(&mut self) {
+        let was_off = self.off;
+        self.off = false;
+        if was_off && self.brightness == 0 {
+            self.brightness = 100;
         }
     }
 }
@@ -169,11 +185,11 @@ pub fn config_path() -> PathBuf {
         .join("config.json")
 }
 
-pub fn load() -> Result<Config> {
+fn load_unlocked() -> Result<Config> {
     let path = config_path();
     if !path.exists() {
         let cfg = Config::default();
-        save(&cfg)?;
+        save_unlocked(&cfg)?;
         return Ok(cfg);
     }
     let text =
@@ -183,11 +199,42 @@ pub fn load() -> Result<Config> {
     Ok(cfg)
 }
 
-pub fn save(cfg: &Config) -> Result<()> {
+fn save_unlocked(cfg: &Config) -> Result<()> {
     let path = config_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    std::fs::write(&path, serde_json::to_string_pretty(cfg)?)?;
+    let parent = path.parent().unwrap();
+    std::fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(".config.json.{}.tmp", std::process::id()));
+    let mut file =
+        std::fs::File::create(&temp).with_context(|| format!("创建临时配置 {}", temp.display()))?;
+    file.write_all(serde_json::to_string_pretty(cfg)?.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&temp, &path).with_context(|| format!("替换配置 {}", path.display()))?;
     Ok(())
+}
+
+pub fn load() -> Result<Config> {
+    let _guard = CONFIG_OP
+        .lock()
+        .map_err(|_| anyhow::anyhow!("配置锁已损坏"))?;
+    load_unlocked()
+}
+
+pub fn save(cfg: &Config) -> Result<()> {
+    let _guard = CONFIG_OP
+        .lock()
+        .map_err(|_| anyhow::anyhow!("配置锁已损坏"))?;
+    save_unlocked(cfg)
+}
+
+/// 在同一把进程内配置锁下完成读取、修改和原子保存，避免线程间覆盖。
+pub fn update<T>(f: impl FnOnce(&mut Config) -> T) -> Result<T> {
+    let _guard = CONFIG_OP
+        .lock()
+        .map_err(|_| anyhow::anyhow!("配置锁已损坏"))?;
+    let mut cfg = load_unlocked()?;
+    let result = f(&mut cfg);
+    save_unlocked(&cfg)?;
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -229,6 +276,26 @@ mod tests {
     #[test]
     fn test_default_has_no_profiles() {
         assert!(Config::default().profiles.is_empty());
+    }
+
+    #[test]
+    fn test_led_off_preserves_settings_and_turn_on_repairs_legacy_zero() {
+        let mut spec = LedSpec::new("breathing", [10, 20, 30], 75, Some("5000"));
+        spec.turn_off();
+        assert!(spec.off);
+        assert_eq!(spec.effect, "breathing");
+        assert_eq!(spec.rgb, [10, 20, 30]);
+        assert_eq!(spec.brightness, 75);
+        assert_eq!(spec.rate.as_deref(), Some("5000"));
+
+        spec.turn_on();
+        assert!(!spec.off);
+        assert_eq!(spec.brightness, 75);
+
+        spec.brightness = 0;
+        spec.turn_off();
+        spec.turn_on();
+        assert_eq!(spec.brightness, 100);
     }
 
     #[test]

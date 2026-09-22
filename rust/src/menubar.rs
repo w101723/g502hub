@@ -31,7 +31,7 @@ use objc2_foundation::MainThreadMarker;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
@@ -72,6 +72,7 @@ struct Core {
     state: Arc<Mutex<State>>,
     tap: Arc<MacroTap>,
     cfg: Config,
+    led_sync_pending: Arc<AtomicBool>,
 }
 
 struct App {
@@ -408,30 +409,26 @@ impl Core {
             .ok()
             .and_then(|cfg| cfg.macros.get(&key).cloned())
             .is_some();
-        let mut cfg = match config::load() {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                self.notify(&format!("读取配置失败: {e}"));
-                return;
-            }
-        };
         let kind_name = match result.kind {
             RecordingKind::Shortcut => "快捷键",
             RecordingKind::Sequence => "按键序列",
         };
-        cfg.macros.insert(
-            key.clone(),
-            MacroBinding {
-                name: Some(format!("录制{kind_name}: {}", result.label)),
-                enabled: true,
-                actions: result.actions,
-            },
-        );
-        if let Err(e) = config::save(&cfg) {
-            self.notify(&format!("保存宏失败: {e}"));
-            return;
-        }
-        self.tap.update_bindings(cfg.macros);
+        let binding = MacroBinding {
+            name: Some(format!("录制{kind_name}: {}", result.label)),
+            enabled: true,
+            actions: result.actions,
+        };
+        let macros = match config::update(|cfg| {
+            cfg.macros.insert(key.clone(), binding);
+            cfg.macros.clone()
+        }) {
+            Ok(macros) => macros,
+            Err(e) => {
+                self.notify(&format!("保存宏失败: {e}"));
+                return;
+            }
+        };
+        self.tap.update_bindings(macros);
         let button = match result.button {
             3 => "G4 / mouse3".to_string(),
             4 => "G5 / mouse4".to_string(),
@@ -470,17 +467,17 @@ impl Core {
             .unwrap_or_else(|| config::LedSpec::new("solid", [255, 255, 255], 100, Some("medium")));
         match &segs[1..] {
             ["off"] => {
-                spec = config::LedSpec::new("off", [0, 0, 0], 0, spec.rate.as_deref());
+                spec.turn_off();
             }
             ["solid", hex] => {
                 spec.rgb = hex_rgb(hex);
                 spec.effect = "solid".into();
-                spec.off = false;
+                spec.turn_on();
             }
             ["breathing", hex] => {
                 spec.rgb = hex_rgb(hex);
                 spec.effect = "breathing".into();
-                spec.off = false;
+                spec.turn_on();
             }
             ["custom", effect] => {
                 let effect = (*effect).to_string();
@@ -491,15 +488,17 @@ impl Core {
             }
             [effect] => {
                 spec.effect = (*effect).into();
-                spec.off = false;
+                spec.turn_on();
             }
             ["rate", value] => {
                 spec.rate = Some((*value).into());
                 if spec.off {
-                    // 灯效关闭时速率仅保存,不写设备
-                    if let Ok(mut cfg) = config::load() {
-                        cfg.led_zones.insert(key, spec.clone());
-                        let _ = config::save(&cfg);
+                    let saved = config::update(|cfg| {
+                        cfg.led_zones.insert(key.clone(), spec.clone());
+                    });
+                    if let Err(e) = saved {
+                        self.notify(&format!("保存灯效失败: {e}"));
+                        return;
                     }
                     self.notify("速率已保存,开启呼吸/循环后生效");
                     if let Ok(mut st) = self.state.lock() {
@@ -515,22 +514,16 @@ impl Core {
             }
             _ => return,
         }
-        let apply = crate::device::get_conn(1).and_then(|dev| {
-            let l = Led::new(&dev)?;
-            if spec.off {
-                l.set_off(zone)
-            } else {
-                let period =
-                    crate::features::led::rate_period_ms(spec.rate.as_deref()).unwrap_or(0);
-                l.set_effect(zone, &spec.effect, spec.rgb, spec.brightness, period)
-            }
-        });
+        if let Err(e) = config::update(|cfg| {
+            cfg.led_zones.insert(key, spec.clone());
+        }) {
+            self.notify(&format!("保存灯效失败: {e}"));
+            return;
+        }
+        let apply = crate::device::get_conn(1)
+            .and_then(|dev| controller::apply_led_spec(&dev, zone, &spec));
         match apply {
             Ok(()) => {
-                if let Ok(mut cfg) = config::load() {
-                    cfg.led_zones.insert(key, spec.clone());
-                    let _ = config::save(&cfg);
-                }
                 let summary = if spec.off {
                     "关闭".to_string()
                 } else {
@@ -546,7 +539,10 @@ impl Core {
                     crate::features::led::zone_label(zone)
                 ));
             }
-            Err(e) => self.notify(&format!("灯效失败: {e}")),
+            Err(e) => {
+                self.led_sync_pending.store(true, Ordering::Release);
+                self.notify(&format!("灯效暂未同步，将自动重试: {e}"));
+            }
         }
         if let Ok(mut st) = self.state.lock() {
             st.dirty = true;
@@ -602,18 +598,17 @@ impl Core {
             .unwrap_or_else(|| config::LedSpec::new(effect, rgb, 100, Some("medium")));
         spec.effect = effect.to_string();
         spec.rgb = rgb;
-        spec.off = false;
-        let period = crate::features::led::rate_period_ms(spec.rate.as_deref()).unwrap_or(0);
-        let r = crate::device::get_conn(1).and_then(|dev| {
-            let l = Led::new(&dev)?;
-            l.set_effect(zone, &spec.effect, spec.rgb, spec.brightness, period)
-        });
+        spec.turn_on();
+        if let Err(e) = config::update(|cfg| {
+            cfg.led_zones.insert(key.to_string(), spec.clone());
+        }) {
+            self.notify(&format!("保存灯效失败: {e}"));
+            return;
+        }
+        let r = crate::device::get_conn(1)
+            .and_then(|dev| controller::apply_led_spec(&dev, zone, &spec));
         match r {
             Ok(()) => {
-                if let Ok(mut cfg) = config::load() {
-                    cfg.led_zones.insert(key.to_string(), spec.clone());
-                    let _ = config::save(&cfg);
-                }
                 self.notify(&format!(
                     "{} 灯效已更新: {} #{:02x}{:02x}{:02x} 亮度{}%",
                     crate::features::led::zone_label(zone),
@@ -624,7 +619,10 @@ impl Core {
                     spec.brightness
                 ));
             }
-            Err(e) => self.notify(&format!("灯效失败: {e}")),
+            Err(e) => {
+                self.led_sync_pending.store(true, Ordering::Release);
+                self.notify(&format!("灯效暂未同步，将自动重试: {e}"));
+            }
         }
         if let Ok(mut st) = self.state.lock() {
             st.dirty = true;
@@ -642,11 +640,10 @@ impl Core {
                         .and_then(|dev| controller::set_dpi_confirmed(&dev, val));
                     match r {
                         Ok(actual) => {
-                            if let Ok(mut cfg) = config::load() {
+                            let _ = config::update(|cfg| {
                                 cfg.desired_mode = DesiredMode::Host;
                                 cfg.desired_dpi = Some(actual);
-                                let _ = config::save(&cfg);
-                            }
+                            });
                             if let Ok(mut st) = self.state.lock() {
                                 st.snap.dpi = Some(actual);
                                 st.snap.mode = Some(OnboardMode::Host);
@@ -682,13 +679,12 @@ impl Core {
                 });
                 match r {
                     Ok((mode, dpi)) => {
-                        if let Ok(mut cfg) = config::load() {
+                        let _ = config::update(|cfg| {
                             cfg.desired_mode = DesiredMode::Host;
                             if let Some(dpi) = dpi {
                                 cfg.desired_dpi = Some(dpi);
                             }
-                            let _ = config::save(&cfg);
-                        }
+                        });
                         if let Ok(mut st) = self.state.lock() {
                             st.snap.mode = Some(mode);
                             st.snap.dpi = dpi;
@@ -721,13 +717,17 @@ impl Core {
                 });
                 match r {
                     Ok((actual, dpi)) => {
-                        if let Ok(mut cfg) = config::load() {
+                        let _ = config::update(|cfg| {
                             cfg.desired_mode = if actual == OnboardMode::Host {
                                 DesiredMode::Host
                             } else {
                                 DesiredMode::Onboard
                             };
-                            let _ = config::save(&cfg);
+                        });
+                        if actual == OnboardMode::Host {
+                            self.led_sync_pending.store(true, Ordering::Release);
+                        } else {
+                            self.led_sync_pending.store(false, Ordering::Release);
                         }
                         if let Ok(mut st) = self.state.lock() {
                             st.snap.mode = Some(actual);
@@ -958,11 +958,17 @@ fn wait_with_interface_watch(dev: &G502Device, seconds: u64) -> bool {
     true
 }
 
-/// 电量轮询线程：新连接时恢复模式/DPI，稳定连接时只读取电池。
-fn poll_loop(state: Arc<Mutex<State>>) {
+/// 电量轮询线程：新连接、系统唤醒或待同步时恢复模式/DPI/RGB。
+fn poll_loop(state: Arc<Mutex<State>>, led_sync_pending: Arc<AtomicBool>) {
+    const SYSTEM_WAKE_GAP: Duration = Duration::from_secs(15);
     let mut active: Option<Arc<G502Device>> = None;
     let mut desc = String::new();
+    let mut last_iteration = Instant::now();
     loop {
+        if last_iteration.elapsed() >= SYSTEM_WAKE_GAP {
+            led_sync_pending.store(true, Ordering::Release);
+        }
+        last_iteration = Instant::now();
         let cfg = config::load().unwrap_or_default();
         let next_delay;
 
@@ -971,9 +977,23 @@ fn poll_loop(state: Arc<Mutex<State>>) {
                 Ok(battery) => {
                     next_delay = 5;
                     publish_battery(&state, desc.clone(), battery);
+                    let pending = led_sync_pending.load(Ordering::Acquire);
+                    if cfg.desired_mode == DesiredMode::Host && pending {
+                        let latest = config::load().unwrap_or(cfg);
+                        match controller::apply_desired_led(&dev, &latest) {
+                            Ok(()) => {
+                                led_sync_pending.store(false, Ordering::Release);
+                            }
+                            Err(e) => {
+                                eprintln!("RGB 自动同步失败: {e}");
+                                led_sync_pending.store(true, Ordering::Release);
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     active = None;
+                    led_sync_pending.store(true, Ordering::Release);
                     let present = g502_interface_present().unwrap_or(true);
                     next_delay = if present { 10 } else { 2 };
                     publish_offline(&state, e.to_string());
@@ -981,23 +1001,22 @@ fn poll_loop(state: Arc<Mutex<State>>) {
             }
         } else {
             match crate::device::get_conn(0).and_then(|dev| {
-                let applied = controller::apply_desired_state(&dev, &cfg)?;
+                let (applied, led_synced) = controller::apply_desired_all(&dev, &cfg)?;
                 if cfg.desired_dpi.is_none() && applied.mode == OnboardMode::Host {
                     if let Some(current_dpi) = applied.dpi {
-                        let mut migrated = cfg.clone();
-                        migrated.desired_dpi = Some(current_dpi);
-                        let _ = config::save(&migrated);
+                        let _ = config::update(|latest| {
+                            latest.desired_dpi = Some(current_dpi);
+                        });
                     }
                 }
-                // 灯效恢复为尽力而为:失败不影响连接与 DPI 恢复。
-                controller::apply_desired_led(&dev, &cfg);
                 let device_desc = crate::device::describe(&dev);
                 let battery = read_battery(&dev)?;
-                Ok((dev, device_desc, battery, applied))
+                Ok((dev, device_desc, battery, applied, led_synced))
             }) {
-                Ok((dev, device_desc, battery, applied)) => {
+                Ok((dev, device_desc, battery, applied, led_synced)) => {
                     next_delay = 5;
                     desc = device_desc;
+                    led_sync_pending.store(!led_synced, Ordering::Release);
                     publish_connected(&state, desc.clone(), battery, applied.dpi, applied.mode);
                     active = Some(dev);
                 }
@@ -1073,10 +1092,12 @@ pub fn run() -> Result<()> {
     }
 
     // 动作工作线程:菜单事件 → 后台执行设备操作,主线程永不阻塞
+    let led_sync_pending = Arc::new(AtomicBool::new(true));
     let core = Arc::new(Core {
         state: state.clone(),
         tap: tap.clone(),
         cfg: cfg.clone(),
+        led_sync_pending: led_sync_pending.clone(),
     });
     let (tx, rx) = mpsc::channel::<String>();
     let _ = ACTION_TX.set(tx);
@@ -1132,7 +1153,8 @@ pub fn run() -> Result<()> {
     }
 
     let poll_state = state.clone();
-    std::thread::spawn(move || poll_loop(poll_state));
+    let poll_led_sync = led_sync_pending.clone();
+    std::thread::spawn(move || poll_loop(poll_state, poll_led_sync));
 
     // CFRunLoopTimer:主线程 0.2s 泵一次,经 context 携带 App 指针
     let app_ptr = &mut app as *mut App;

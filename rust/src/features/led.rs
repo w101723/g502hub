@@ -245,8 +245,24 @@ impl<'a> Led<'a> {
     }
 
     fn send_f3(&self, params: &[u8; 16]) -> Result<(), HidppError> {
-        self.dev.request_long(self.index, 0x03, params)?;
-        Ok(())
+        for attempt in 0..3 {
+            match self.dev.request_long(self.index, 0x03, params) {
+                Ok(_) => return Ok(()),
+                Err(e) if attempt < 2 && is_transient_error(&e) => {
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!()
+    }
+}
+
+fn is_transient_error(error: &HidppError) -> bool {
+    match error {
+        HidppError::Timeout(_) | HidppError::Io(_) => true,
+        HidppError::Rejected { code, .. } => matches!(*code, 0x04 | 0x07 | 0x09 | 0x0B),
+        HidppError::Open(_) | HidppError::Invalid(_) => false,
     }
 }
 
@@ -401,6 +417,16 @@ mod tests {
         assert_eq!(SLOT_SOLID, 1);
         assert_eq!(SLOT_CYCLE, 2);
         assert_eq!(SLOT_BREATHING, 3);
+        assert!(is_transient_error(&HidppError::Timeout("test".into())));
+        assert!(is_transient_error(&HidppError::Rejected {
+            code: 0x09,
+            message: "busy".into(),
+        }));
+        assert!(!is_transient_error(&HidppError::Invalid("bad".into())));
+        assert!(!is_transient_error(&HidppError::Rejected {
+            code: 0x03,
+            message: "invalid value".into(),
+        }));
     }
     #[test]
     fn test_rate_period_mapping() {
