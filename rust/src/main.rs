@@ -5,6 +5,7 @@ mod features;
 mod hidpp;
 mod macro_engine;
 mod menubar;
+mod panel;
 mod probe;
 
 use anyhow::{bail, Result};

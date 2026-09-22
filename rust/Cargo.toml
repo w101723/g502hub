@@ -7,8 +7,33 @@ edition = "2021"
 hidapi = { version = "2.6", features = ["macos-shared-device"] }
 tray-icon = "0.19"
 objc2 = "0.5"
-objc2-app-kit = "0.2"
-objc2-foundation = "0.2"
+objc2-app-kit = { version = "0.2", features = [
+    "NSPanel",
+    "NSWindow",
+    "NSGraphics",
+    "NSVisualEffectView",
+    "NSStackView",
+    "NSSlider",
+    "NSSliderCell",
+    "NSButton",
+    "NSButtonCell",
+    "NSSegmentedControl",
+    "NSSegmentedCell",
+    "NSBox",
+    "NSFont",
+    "NSTextField",
+    "NSTextFieldCell",
+    "NSColor",
+    "NSEvent",
+    "NSGraphicsContext",
+    "NSAnimationContext",
+    "NSLayoutConstraint",
+    "NSView",
+    "NSControl",
+    "NSUserInterfaceLayout",
+    "NSScreen",
+] }
+objc2-foundation = { version = "0.2", features = ["NSRunLoop", "NSNotification", "NSGeometry", "NSValue", "NSArray", "NSString"] }
 core-graphics = "0.24"
 core-foundation = "0.10"
 core-foundation-sys = "0.8"

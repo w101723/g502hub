@@ -33,13 +33,13 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 static QUIT: AtomicBool = AtomicBool::new(false);
 static ACTION_TX: std::sync::OnceLock<mpsc::Sender<String>> = std::sync::OnceLock::new();
 
 /// 菜单预设色(任意颜色走"自定义颜色…"调起系统取色器)。
-const LED_COLORS: &[(&str, &str)] = &[
+pub const LED_COLORS: &[(&str, &str)] = &[
     ("白", "ffffff"),
     ("红", "ff0000"),
     ("橙", "ff6600"),
@@ -107,6 +107,9 @@ impl App {
         self.battery_line = MenuItem::with_id("noop", "", false, None);
         self.mode_line = MenuItem::with_id("noop", "", false, None);
         self.mode_action = MenuItem::with_id("mode:toggle", "切换控制模式", false, None);
+        let panel_item = MenuItem::with_id("panel:open", "✨ 打开控制中心浮窗…", true, None);
+        let _ = menu.append(&panel_item);
+        let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&self.header);
         let _ = menu.append(&self.battery_line);
         let _ = menu.append(&self.mode_line);
@@ -283,6 +286,20 @@ impl App {
                 item.set_checked(snap.dpi == Some(*lvl));
             }
         }
+
+        // 同步状态到 PopoverPanel
+        let battery_str = snap
+            .battery
+            .as_ref()
+            .map(|b| format!("🔋{}% {}{}", b.percent, b.state_text, b.voltage_mv.map(|v| format!(" · {v}mV")).unwrap_or_default()))
+            .unwrap_or_else(|| "🔋 未连接".into());
+        let mode_str = match snap.mode {
+            Some(OnboardMode::Onboard) => "控制模式: 板载控制 (固件自管)",
+            Some(OnboardMode::Host) => "控制模式: 主机控制 (自动恢复)",
+            None => "控制模式: 未知",
+        };
+        crate::panel::PopoverPanel::sync_status(&battery_str, mode_str, snap.dpi);
+
         let cfg = config::load().unwrap_or_else(|_| self.cfg.clone());
         let binding_text = |key: &str| {
             cfg.macros
@@ -634,6 +651,9 @@ impl Core {
         let (kind, arg) = (parts[0], parts.get(1).copied().unwrap_or(""));
         match (kind, arg) {
             ("noop", _) => {}
+            ("panel", "open") => {
+                crate::panel::PopoverPanel::request_show();
+            }
             ("dpi", v) => {
                 if let Ok(val) = v.parse::<u16>() {
                     let r = crate::device::get_conn(2)
@@ -823,7 +843,7 @@ impl Core {
     }
 }
 
-fn hex_rgb(s: &str) -> [u8; 3] {
+pub fn hex_rgb(s: &str) -> [u8; 3] {
     if s.len() != 6 {
         return [255, 255, 255];
     }
@@ -1120,6 +1140,7 @@ pub fn run() -> Result<()> {
         .with_icon(icon)
         .with_icon_as_template(true)
         .with_tooltip("G502 LIGHTSPEED")
+        .with_menu_on_left_click(false)
         .build()?;
     tray.set_title::<&str>(None);
 
@@ -1151,6 +1172,9 @@ pub fn run() -> Result<()> {
         let snap = state.lock().unwrap().snap.clone();
         app.refresh_menu(&snap);
     }
+
+    // 初始化控制中心浮窗
+    crate::panel::PopoverPanel::init(mtm);
 
     let poll_state = state.clone();
     let poll_led_sync = led_sync_pending.clone();
@@ -1203,16 +1227,33 @@ extern "C" fn pump_callback(_timer: CFRunLoopTimerRef, info: *mut std::ffi::c_vo
         app.last_recording_serial = serial;
     }
 
-    // 1. 菜单事件 → 转发到工作线程(主线程不执行设备操作)
+    // 0. 消费来自菜单或其他线程的弹窗请求
+    crate::panel::PopoverPanel::poll_open_request();
+
+    // 1. 托盘点击事件：左键弹出/收起 PopoverPanel (只响应 Down 避免双触发)
+    let tray_receiver = TrayIconEvent::receiver();
+    while let Ok(ev) = tray_receiver.try_recv() {
+        if let TrayIconEvent::Click { button, rect, button_state, .. } = ev {
+            if button == MouseButton::Left && button_state == tray_icon::MouseButtonState::Down {
+                crate::panel::PopoverPanel::toggle_at(Some(rect));
+            }
+        }
+    }
+
+    // 2. 菜单事件 → 转发到工作线程(主线程不执行设备操作)
     let receiver = MenuEvent::receiver();
     while let Ok(ev) = receiver.try_recv() {
         let id = ev.id().0.clone();
+        if id == "panel:open" {
+            crate::panel::PopoverPanel::show_at(None);
+            continue;
+        }
         if let Some(tx) = ACTION_TX.get() {
             let _ = tx.send(id);
         }
     }
 
-    // 2. 状态变化 → 快照后原地刷新(不持锁渲染)
+    // 3. 状态变化 → 快照后原地刷新(不持锁渲染)
     let snap = {
         let mut st = match app.state.try_lock() {
             Ok(st) => st,

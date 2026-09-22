@@ -8,8 +8,8 @@ use crate::features::dpi::Dpi;
 use crate::features::led::{self, Led};
 use crate::features::onboard::{get_onboard_mode, set_onboard_mode, OnboardMode};
 use crate::hidpp::HidppError;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 static DEVICE_OP: Mutex<()> = Mutex::new(());
 
@@ -156,4 +156,120 @@ pub fn apply_desired_all(
         };
         Ok((state, led_synced))
     })
+}
+
+#[derive(Clone)]
+pub enum TargetZone {
+    Single(u8),
+    All,
+}
+
+#[derive(Clone)]
+struct PendingUpdate {
+    target: TargetZone,
+    spec: crate::config::LedSpec,
+    updated_at: Instant,
+}
+
+struct LiveLedState {
+    pending_dispatch: Option<PendingUpdate>,
+    pending_persist: Option<PendingUpdate>,
+}
+
+static LIVE_LED: OnceLock<(Mutex<LiveLedState>, Condvar)> = OnceLock::new();
+
+fn get_live_channel() -> &'static (Mutex<LiveLedState>, Condvar) {
+    LIVE_LED.get_or_init(|| {
+        let pair = (
+            Mutex::new(LiveLedState {
+                pending_dispatch: None,
+                pending_persist: None,
+            }),
+            Condvar::new(),
+        );
+        std::thread::spawn(live_led_worker);
+        pair
+    })
+}
+
+fn live_led_worker() {
+    let (lock, cvar) = get_live_channel();
+    let mut guard = lock.lock().unwrap();
+    loop {
+        // 1. 如果有待下发到设备的指令，优先下发
+        if let Some(cmd) = guard.pending_dispatch.take() {
+            guard.pending_persist = Some(cmd.clone());
+            drop(guard);
+
+            if let Ok(dev) = crate::device::get_conn(1) {
+                let _ = with_device_lock(|| {
+                    let led = Led::new(&dev)?;
+                    match cmd.target {
+                        TargetZone::Single(z) => {
+                            apply_led_spec_inner(&led, z, &cmd.spec)?;
+                        }
+                        TargetZone::All => {
+                            apply_led_spec_inner(&led, led::ZONE_PRIMARY, &cmd.spec)?;
+                            std::thread::sleep(Duration::from_millis(25));
+                            apply_led_spec_inner(&led, led::ZONE_LOGO, &cmd.spec)?;
+                        }
+                    }
+                    Ok(())
+                });
+            }
+
+            // 下发后做短暂合流保护（30ms），防止高频拖动冲垮固件
+            std::thread::sleep(Duration::from_millis(30));
+            guard = lock.lock().unwrap();
+            continue;
+        }
+
+        // 2. 如果没有待下发，但有待落盘的配置，检查是否满足 200ms 静止防抖
+        if let Some(ref cur) = guard.pending_persist {
+            let elapsed = cur.updated_at.elapsed();
+            let debounce = Duration::from_millis(200);
+            if elapsed >= debounce {
+                let to_save = guard.pending_persist.take().unwrap();
+                drop(guard);
+
+                let _ = crate::config::update(|cfg| match to_save.target {
+                    TargetZone::Single(z) => {
+                        cfg.led_zones
+                            .insert(led::zone_key(z).to_string(), to_save.spec);
+                    }
+                    TargetZone::All => {
+                        cfg.led_zones
+                            .insert(led::zone_key(led::ZONE_PRIMARY).to_string(), to_save.spec.clone());
+                        cfg.led_zones
+                            .insert(led::zone_key(led::ZONE_LOGO).to_string(), to_save.spec);
+                    }
+                });
+                guard = lock.lock().unwrap();
+            } else {
+                // 未达 200ms，休眠剩余时间（若有新指令输入则被即时打断）
+                let remaining = debounce - elapsed;
+                let (new_guard, _) = cvar.wait_timeout(guard, remaining).unwrap();
+                guard = new_guard;
+            }
+            continue;
+        }
+
+        // 3. 既无待下发也无待落盘，完全休眠直到收到新指令
+        guard = cvar.wait(guard).unwrap();
+    }
+}
+
+/// 专供 UI 滑块 / 色块快速点击使用的合流节流下发接口：
+/// - 极速响应：立即合流下发给设备；
+/// - 防抖落盘：滑动停止后自动持久化到配置；
+/// - 不阻塞当前线程。
+pub fn schedule_live_led(target: TargetZone, spec: crate::config::LedSpec) {
+    let (lock, cvar) = get_live_channel();
+    let mut guard = lock.lock().unwrap();
+    guard.pending_dispatch = Some(PendingUpdate {
+        target,
+        spec,
+        updated_at: Instant::now(),
+    });
+    cvar.notify_one();
 }
