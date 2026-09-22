@@ -151,7 +151,7 @@ impl<'a> Led<'a> {
         self.send_f3(&params)
     }
 
-    /// 固定色:[zone, 1, R, G, B, 亮度(0-100)]。亮度靠缩放 RGB 实现。
+    /// 固定色:[zone, 1, R, G, B, 0x02, 0...]。RGB 靠缩放亮度预处理。
     pub fn set_solid(&self, zone: u8, rgb: [u8; 3], brightness: u8) -> Result<(), HidppError> {
         let rgb = scale_rgb(rgb, brightness);
         let params: [u8; 16] = [
@@ -160,7 +160,7 @@ impl<'a> Led<'a> {
             rgb[0],
             rgb[1],
             rgb[2],
-            brightness.min(100),
+            0x02,
             0,
             0,
             0,
@@ -175,27 +175,27 @@ impl<'a> Led<'a> {
         self.send_f3(&params)
     }
 
-    /// 变色循环:[zone, 2, 0x0003, 强度, 饱和度, 周期(2B 大端 ms)]。
+    /// 变色循环:[zone, 2, 0, 0, 0, 0, 0, 周期高8位, 周期低8位, 亮度(0-100), 0...]。
+    /// 依据 LGHUB 核心驱动 Feature8070ColorLEDEffects 原厂反编译规范：
+    /// payload[0..4]=0, payload[5..6]=period_ms(BE), payload[7]=brightness(0-100)。
     pub fn set_cycle(&self, zone: u8, period_ms: u16, brightness: u8) -> Result<(), HidppError> {
-        let intensity = intensity_byte(brightness);
-        // 周期 0(即"默认速率")以 2000ms 下发;其余值收紧到官方
-        // 1000–20000ms——越界值会被固件接受但卡死效果引擎(真机实测)
         let period = if period_ms == 0 {
             RATE_MEDIUM_MS
         } else {
             period_ms.clamp(RATE_MIN_MS, RATE_MAX_MS)
         };
+        let b = brightness.min(100);
         let params: [u8; 16] = [
             zone,
             SLOT_CYCLE,
-            0x00,
-            0x03,
-            intensity,
-            0xFF,
+            0,
+            0,
+            0,
+            0,
+            0,
             (period >> 8) as u8,
-            period as u8,
-            0,
-            0,
+            (period & 0xff) as u8,
+            b,
             0,
             0,
             0,
@@ -206,7 +206,12 @@ impl<'a> Led<'a> {
         self.send_f3(&params)
     }
 
-    /// 呼吸:[zone, 3, 0x000A, R, G, B, 周期(2B 大端 ms), 强度]。
+    /// 呼吸:[zone, 3, R, G, B, 周期高8位, 周期低8位, 0x00, 亮度(0-100), 0...]。
+    /// 依据 LGHUB 核心驱动 feature_8070_lighting_effects::get_raw_effect_params 原厂反编译规范：
+    /// - payload[0..2] = RGB (未软件缩放的原色，由固件硬件 PWM 自行插值呼吸)
+    /// - payload[3..4] = period_ms (2字节大端毫秒数，1000~10000ms)
+    /// - payload[5]    = 0x00 (固定为零；非零值会触发固件方波频闪/错误闪烁)
+    /// - payload[6]    = brightness (0~100 整数亮度百分比，作为呼吸波峰强度)
     pub fn set_breathing(
         &self,
         zone: u8,
@@ -214,26 +219,23 @@ impl<'a> Led<'a> {
         period_ms: u16,
         brightness: u8,
     ) -> Result<(), HidppError> {
-        let intensity = intensity_byte(brightness);
-        // 周期 0(即"默认速率")以 2000ms 下发;其余值收紧到官方
-        // 1000–20000ms——越界值会被固件接受但卡死效果引擎(真机实测)
         let period = if period_ms == 0 {
             RATE_MEDIUM_MS
         } else {
             period_ms.clamp(RATE_MIN_MS, RATE_MAX_MS)
         };
-        let rgb = scale_rgb(rgb, brightness);
+        let b = brightness.min(100);
         let params: [u8; 16] = [
             zone,
             SLOT_BREATHING,
-            0x00,
-            0x0A,
             rgb[0],
             rgb[1],
             rgb[2],
             (period >> 8) as u8,
-            period as u8,
-            intensity,
+            (period & 0xff) as u8,
+            0x00,
+            b,
+            0,
             0,
             0,
             0,
@@ -267,6 +269,7 @@ fn is_transient_error(error: &HidppError) -> bool {
 }
 
 /// 亮度百分比(0-100)→ 效果强度字节(0-255,cycle/breathing 用)。
+#[allow(dead_code)]
 fn intensity_byte(brightness: u8) -> u8 {
     ((brightness.min(100) as u16) * 255 / 100) as u8
 }
@@ -402,25 +405,23 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn test_libratbag_vs_our_format() {
+    fn test_live_breathing_rates() {
         let dev = crate::device::G502Device::open().expect("设备未连接");
-        let idx = dev.feature(F_COLOR_LED_EFFECTS).expect("无 0x8070");
+        let led = Led::new(&dev).expect("初始化 Led 失败");
 
-        // Format A (our current code):
-        // [zone, 3, 0x00, 0x0A, R, G, B, period_hi, period_lo, intensity, 0, 0, 0, 0, 0, 0]
-        let p_ours = [
-            0, 3, 0x00, 0x0A, 0xFF, 0x00, 0x00, 0x07, 0xD0, 0xFF, 0, 0, 0, 0, 0, 0,
-        ];
-        let r_ours = dev.transport.request(dev.dev_index, idx, 0x03, &p_ours, true, 800);
-        println!("Our format result: {:?}", r_ours);
+        // 快速呼吸 (1000ms, 蓝色)
+        println!("下发 1000ms 快速呼吸 (蓝色)");
+        led.set_breathing(0, [0x00, 0xC8, 0xFF], 1000, 100).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(4));
 
-        // Format B (libratbag):
-        // [zone, mode=0x0A, R, G, B, period_hi, period_lo, waveform=0, intensity=0, 0, 0, 0, ram_and_flash=1, 0, 0, 0]
-        let p_ratbag = [
-            0, 0x0A, 0xFF, 0x00, 0x00, 0x07, 0xD0, 0x00, 0x00, 0, 0, 0, 1, 0, 0, 0,
-        ];
-        let r_ratbag = dev.transport.request(dev.dev_index, idx, 0x03, &p_ratbag, true, 800);
-        println!("Libratbag format result: {:?}", r_ratbag);
+        // 慢速呼吸 (4000ms, 红色)
+        println!("下发 4000ms 舒缓呼吸 (红色)");
+        led.set_breathing(0, [0xFF, 0x00, 0x00], 4000, 100).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(8));
+
+        // 恢复关闭
+        led.set_off(0).unwrap();
+        println!("测试完成");
     }
 
     #[test]
@@ -476,5 +477,64 @@ mod tests {
         assert_eq!(zone_from_key("bogus"), None);
         assert_eq!(zone_key(ZONE_LOGO), "logo");
         assert_eq!(zone_label(ZONE_PRIMARY), "主要");
+    }
+
+    #[test]
+    fn test_breathing_cycle_payload_layout() {
+        // 验证呼吸帧布局符合 LGHUB 原厂反编译 0x8070 规范
+        let period_ms: u16 = 2000;
+        let brightness: u8 = 80;
+        let rgb = [0x00, 0xC8, 0xFF];
+        let p_breathing: [u8; 16] = [
+            0,
+            SLOT_BREATHING,
+            rgb[0],
+            rgb[1],
+            rgb[2],
+            (period_ms >> 8) as u8,
+            (period_ms & 0xff) as u8,
+            0x00,
+            brightness,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        assert_eq!(p_breathing[0], 0); // zone
+        assert_eq!(p_breathing[1], 3); // slot
+        assert_eq!(&p_breathing[2..5], &[0x00, 0xC8, 0xFF]); // RGB
+        assert_eq!(p_breathing[5], 0x07); // 2000 ms high byte
+        assert_eq!(p_breathing[6], 0xD0); // 2000 ms low byte
+        assert_eq!(p_breathing[7], 0x00); // waveform/flag 必须为 0，防止方波闪烁
+        assert_eq!(p_breathing[8], 80); // 亮度 (0..100)
+
+        // 验证循环帧布局
+        let p_cycle: [u8; 16] = [
+            0,
+            SLOT_CYCLE,
+            0,
+            0,
+            0,
+            0,
+            0,
+            (period_ms >> 8) as u8,
+            (period_ms & 0xff) as u8,
+            brightness,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        assert_eq!(p_cycle[0], 0);
+        assert_eq!(p_cycle[1], 2);
+        assert_eq!(&p_cycle[2..7], &[0, 0, 0, 0, 0]);
+        assert_eq!(p_cycle[7], 0x07);
+        assert_eq!(p_cycle[8], 0xD0);
+        assert_eq!(p_cycle[9], 80);
     }
 }
