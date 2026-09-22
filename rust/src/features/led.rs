@@ -401,6 +401,29 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn test_libratbag_vs_our_format() {
+        let dev = crate::device::G502Device::open().expect("设备未连接");
+        let idx = dev.feature(F_COLOR_LED_EFFECTS).expect("无 0x8070");
+
+        // Format A (our current code):
+        // [zone, 3, 0x00, 0x0A, R, G, B, period_hi, period_lo, intensity, 0, 0, 0, 0, 0, 0]
+        let p_ours = [
+            0, 3, 0x00, 0x0A, 0xFF, 0x00, 0x00, 0x07, 0xD0, 0xFF, 0, 0, 0, 0, 0, 0,
+        ];
+        let r_ours = dev.transport.request(dev.dev_index, idx, 0x03, &p_ours, true, 800);
+        println!("Our format result: {:?}", r_ours);
+
+        // Format B (libratbag):
+        // [zone, mode=0x0A, R, G, B, period_hi, period_lo, waveform=0, intensity=0, 0, 0, 0, ram_and_flash=1, 0, 0, 0]
+        let p_ratbag = [
+            0, 0x0A, 0xFF, 0x00, 0x00, 0x07, 0xD0, 0x00, 0x00, 0, 0, 0, 1, 0, 0, 0,
+        ];
+        let r_ratbag = dev.transport.request(dev.dev_index, idx, 0x03, &p_ratbag, true, 800);
+        println!("Libratbag format result: {:?}", r_ratbag);
+    }
+
+    #[test]
     fn test_effect_layout_constants() {
         assert_eq!(ALL_EFFECTS, &[0x01, 0x0A, 0x03]);
         assert_eq!(effect_id("solid"), Some(0x01));

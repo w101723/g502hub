@@ -18,7 +18,7 @@ use objc2_foundation::{
     MainThreadMarker, NSArray, NSEdgeInsets, NSNotification, NSNotificationCenter, NSPoint, NSRect,
     NSSize, NSString,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 declare_class!(
@@ -122,11 +122,13 @@ struct PanelHolder {
     dpi_control: Retained<NSSegmentedControl>,
     zone_control: Retained<NSSegmentedControl>,
     effect_control: Retained<NSSegmentedControl>,
+    color_label: Retained<NSTextField>,
+    color_buttons: Vec<Retained<NSButton>>,
     brightness_slider: Retained<NSSlider>,
     brightness_label: Retained<NSTextField>,
     rate_slider: Retained<NSSlider>,
     rate_label: Retained<NSTextField>,
-    _color_buttons: Vec<Retained<NSButton>>,
+    active_rgb: Cell<[u8; 3]>,
     _dispatcher: Retained<PanelDispatcher>,
 }
 
@@ -142,7 +144,7 @@ pub struct PopoverPanel;
 impl PopoverPanel {
     pub fn init(mtm: MainThreadMarker) {
         let panel_width = 330.0;
-        let panel_height = 490.0;
+        let panel_height = 515.0;
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(panel_width, panel_height));
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::FullSizeContentView
@@ -313,7 +315,25 @@ impl PopoverPanel {
             root_stack.addArrangedSubview(&effect_control);
         }
 
-        // 5. 颜色预设网格 (10 个颜色按钮)
+        // 5. 颜色预设网格 (10 个颜色按钮 + 选定回显)
+        let color_header = unsafe { NSStackView::new(mtm) };
+        unsafe {
+            color_header.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+            color_header.setSpacing(6.0);
+        }
+        let color_title = unsafe { NSTextField::labelWithString(&NSString::from_str("预设色彩"), mtm) };
+        unsafe {
+            color_title.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
+            color_header.addArrangedSubview(&color_title);
+        }
+        let color_label = unsafe { NSTextField::labelWithString(&NSString::from_str("选定色彩: --"), mtm) };
+        unsafe {
+            color_label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+            color_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            color_header.addArrangedSubview(&color_label);
+            root_stack.addArrangedSubview(&color_header);
+        }
+
         let color_row1 = unsafe { NSStackView::new(mtm) };
         let color_row2 = unsafe { NSStackView::new(mtm) };
         unsafe {
@@ -334,6 +354,7 @@ impl PopoverPanel {
                 )
             };
             unsafe {
+                btn.setButtonType(objc2_app_kit::NSButtonType::PushOnPushOff);
                 btn.setTag(i as isize);
                 btn.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             }
@@ -382,7 +403,7 @@ impl PopoverPanel {
             root_stack.addArrangedSubview(&bright_row);
         }
 
-        // 7. 速率调节滑块
+        // 7. 速率调节滑块 (1000ms~10000ms / 1.0s~10.0s)
         let rate_row = unsafe { NSStackView::new(mtm) };
         unsafe {
             rate_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
@@ -397,7 +418,7 @@ impl PopoverPanel {
             NSSlider::sliderWithValue_minValue_maxValue_target_action(
                 2000.0,
                 1000.0,
-                20000.0,
+                10000.0,
                 Some(&dispatcher),
                 Some(sel!(onRateChanged:)),
                 mtm,
@@ -407,7 +428,7 @@ impl PopoverPanel {
             rate_slider.setContinuous(true);
             rate_row.addArrangedSubview(&rate_slider);
         }
-        let rate_label = unsafe { NSTextField::labelWithString(&NSString::from_str("2.0s"), mtm) };
+        let rate_label = unsafe { NSTextField::labelWithString(&NSString::from_str("2.0s (中)"), mtm) };
         unsafe {
             rate_label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             rate_row.addArrangedSubview(&rate_label);
@@ -432,11 +453,13 @@ impl PopoverPanel {
             dpi_control,
             zone_control,
             effect_control,
+            color_label,
+            color_buttons,
             brightness_slider,
             brightness_label,
             rate_slider,
             rate_label,
-            _color_buttons: color_buttons,
+            active_rgb: Cell::new([0, 200, 255]),
             _dispatcher: dispatcher,
         };
 
@@ -485,18 +508,13 @@ impl PopoverPanel {
                 let panel_frame = h.panel.frame();
 
                 let (origin_x, origin_y) = if let Some(rect) = tray_rect {
-                    // tray_icon 的 rect 已经过逻辑/物理换算，但在多屏或顶部菜单栏坐标系下：
-                    // macOS 屏幕原点 (0,0) 在左下角，主屏幕顶部 y 为 screen_h。
-                    // 若 rect 物理坐标过大，根据屏幕可视区域适配。
                     let screen_frame = NSScreen::mainScreen(MainThreadMarker::from(&*h.panel))
                         .map(|s| s.visibleFrame())
                         .unwrap_or(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0)));
 
                     let mut x = rect.position.x + (rect.size.width as f64 / 2.0) - (panel_frame.size.width / 2.0);
-                    // 托盘在顶部，浮窗紧贴菜单栏底边缘
                     let mut y = screen_frame.origin.y + screen_frame.size.height - panel_frame.size.height - 4.0;
 
-                    // 边界限制
                     let max_x = screen_frame.origin.x + screen_frame.size.width - panel_frame.size.width - 8.0;
                     let min_x = screen_frame.origin.x + 8.0;
                     if x > max_x {
@@ -575,6 +593,126 @@ impl PopoverPanel {
         });
     }
 
+    // ---- 颜色比对与 UI 回显格式化 ----
+
+    fn find_matching_color_idx(rgb: [u8; 3]) -> Option<usize> {
+        for (i, (_name, hex)) in crate::menubar::LED_COLORS.iter().enumerate() {
+            if crate::menubar::hex_rgb(hex) == rgb {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn update_color_ui(
+        color_buttons: &[Retained<NSButton>],
+        color_label: &NSTextField,
+        rgb: [u8; 3],
+        effect_idx: usize,
+    ) {
+        let matching_idx = Self::find_matching_color_idx(rgb);
+        let color_enabled = effect_idx != 0 && effect_idx != 2;
+
+        for (i, btn) in color_buttons.iter().enumerate() {
+            let name = crate::menubar::LED_COLORS[i].0;
+            let is_selected = Some(i) == matching_idx && color_enabled;
+            let title = if is_selected {
+                format!("✓ {name}")
+            } else {
+                name.to_string()
+            };
+            unsafe {
+                btn.setTitle(&NSString::from_str(&title));
+                btn.setEnabled(color_enabled);
+                btn.setState(if is_selected {
+                    objc2_app_kit::NSControlStateValueOn
+                } else {
+                    objc2_app_kit::NSControlStateValueOff
+                });
+                btn.highlight(is_selected);
+            }
+        }
+
+        let text = if effect_idx == 0 {
+            "灯效已关闭".to_string()
+        } else if effect_idx == 2 {
+            "彩色循环 (色彩自动过渡)".to_string()
+        } else {
+            match matching_idx {
+                Some(i) => {
+                    let (name, hex) = crate::menubar::LED_COLORS[i];
+                    format!("选定: {name} · #{hex}")
+                }
+                None => {
+                    format!("选定: 自定义 · #{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
+                }
+            }
+        };
+        unsafe {
+            color_label.setStringValue(&NSString::from_str(&text));
+        }
+    }
+
+    fn format_rate_label(period_ms: u16, effect_idx: usize) -> String {
+        if effect_idx == 0 || effect_idx == 1 {
+            return "不适用".into();
+        }
+        let sec = period_ms as f32 / 1000.0;
+        let desc = if period_ms <= 1500 {
+            "快"
+        } else if period_ms <= 3000 {
+            "适中"
+        } else if period_ms <= 6000 {
+            "舒缓"
+        } else {
+            "慢速"
+        };
+        format!("{sec:.1}s ({desc})")
+    }
+
+    // ---- 状态提取与合流下发核心逻辑 ----
+
+    fn collect_and_schedule(h: &PanelHolder) {
+        let zone_seg = unsafe { h.zone_control.selectedSegment() } as usize;
+        let target = Self::current_target_zone(zone_seg);
+        let effect_seg = unsafe { h.effect_control.selectedSegment() } as usize;
+        let brightness = unsafe { h.brightness_slider.doubleValue() } as u8;
+        let rate_raw = unsafe { h.rate_slider.doubleValue() } as u16;
+        let rate_ms = if rate_raw == 0 {
+            2000
+        } else {
+            let rounded = ((rate_raw + 50) / 100) * 100;
+            rounded.clamp(1000, 10000)
+        };
+        let rgb = h.active_rgb.get();
+
+        let mut spec = crate::config::LedSpec::new(
+            "breathing",
+            rgb,
+            brightness,
+            Some(&rate_ms.to_string()),
+        );
+
+        match effect_seg {
+            0 => spec.turn_off(),
+            1 => {
+                spec.turn_on();
+                spec.effect = "solid".into();
+            }
+            2 => {
+                spec.turn_on();
+                spec.effect = "cycle".into();
+            }
+            3 => {
+                spec.turn_on();
+                spec.effect = "breathing".into();
+            }
+            _ => {}
+        }
+
+        controller::schedule_live_led(target, spec);
+    }
+
     // ---- 事件分发逻辑 ----
 
     fn dispatch_dpi(dpi: u16) {
@@ -599,46 +737,42 @@ impl PopoverPanel {
     }
 
     fn current_spec(zone_seg: usize) -> crate::config::LedSpec {
+        let zone_key = match zone_seg {
+            2 => "logo",
+            _ => "primary",
+        };
+        if let Some(spec) = controller::get_live_spec_for_zone(zone_key) {
+            return spec;
+        }
         let cfg = crate::config::load().unwrap_or_default();
         match zone_seg {
             2 => cfg.led_zones.get("logo").cloned().unwrap_or_else(|| {
-                crate::config::LedSpec::new("breathing", [34, 68, 255], 100, Some("2000"))
+                crate::config::LedSpec::new("breathing", [0, 200, 255], 100, Some("2000"))
             }),
             _ => cfg.led_zones.get("primary").cloned().unwrap_or_else(|| {
-                crate::config::LedSpec::new("breathing", [255, 0, 0], 100, Some("2000"))
+                crate::config::LedSpec::new("breathing", [255, 204, 0], 100, Some("2000"))
             }),
         }
     }
 
-    fn dispatch_zone(_zone_idx: usize) {
-        Self::sync_ui_from_config();
+    fn dispatch_zone(zone_idx: usize) {
+        Self::sync_ui_from_config_for_zone(zone_idx);
     }
 
     fn dispatch_effect(effect_seg: usize) {
         HOLDER.with(|cell| {
             if let Some(h) = cell.borrow().as_ref() {
-                let zone_seg = unsafe { h.zone_control.selectedSegment() } as usize;
-                let target = Self::current_target_zone(zone_seg);
-                let mut spec = Self::current_spec(zone_seg);
+                let rgb = h.active_rgb.get();
+                Self::update_color_ui(&h.color_buttons, &h.color_label, rgb, effect_seg);
 
-                match effect_seg {
-                    0 => spec.turn_off(),
-                    1 => {
-                        spec.turn_on();
-                        spec.effect = "solid".into();
-                    }
-                    2 => {
-                        spec.turn_on();
-                        spec.effect = "cycle".into();
-                    }
-                    3 => {
-                        spec.turn_on();
-                        spec.effect = "breathing".into();
-                    }
-                    _ => {}
+                let rate_raw = unsafe { h.rate_slider.doubleValue() } as u16;
+                let rate_ms = if rate_raw == 0 { 2000 } else { rate_raw.clamp(1000, 10000) };
+                unsafe {
+                    h.rate_slider.setEnabled(effect_seg == 2 || effect_seg == 3);
+                    h.rate_label.setStringValue(&NSString::from_str(&Self::format_rate_label(rate_ms, effect_seg)));
                 }
 
-                controller::schedule_live_led(target, spec);
+                Self::collect_and_schedule(h);
             }
         });
     }
@@ -648,18 +782,24 @@ impl PopoverPanel {
             let rgb = crate::menubar::hex_rgb(hex);
             HOLDER.with(|cell| {
                 if let Some(h) = cell.borrow().as_ref() {
-                    let zone_seg = unsafe { h.zone_control.selectedSegment() } as usize;
-                    let target = Self::current_target_zone(zone_seg);
-                    let mut spec = Self::current_spec(zone_seg);
+                    h.active_rgb.set(rgb);
 
-                    spec.turn_on();
-                    spec.rgb = rgb;
-                    if spec.effect == "off" || spec.effect == "cycle" {
-                        spec.effect = "breathing".into();
+                    let mut effect_seg = unsafe { h.effect_control.selectedSegment() } as usize;
+                    if effect_seg == 0 || effect_seg == 2 {
+                        effect_seg = 3; // 切换到呼吸
                         unsafe { h.effect_control.setSelectedSegment(3); }
                     }
 
-                    controller::schedule_live_led(target, spec);
+                    Self::update_color_ui(&h.color_buttons, &h.color_label, rgb, effect_seg);
+
+                    let rate_raw = unsafe { h.rate_slider.doubleValue() } as u16;
+                    let rate_ms = if rate_raw == 0 { 2000 } else { rate_raw.clamp(1000, 10000) };
+                    unsafe {
+                        h.rate_slider.setEnabled(effect_seg == 2 || effect_seg == 3);
+                        h.rate_label.setStringValue(&NSString::from_str(&Self::format_rate_label(rate_ms, effect_seg)));
+                    }
+
+                    Self::collect_and_schedule(h);
                 }
             });
         }
@@ -668,20 +808,11 @@ impl PopoverPanel {
     fn dispatch_brightness(val: u8) {
         HOLDER.with(|cell| {
             if let Some(h) = cell.borrow().as_ref() {
-                let zone_seg = unsafe { h.zone_control.selectedSegment() } as usize;
-                let target = Self::current_target_zone(zone_seg);
-                let mut spec = Self::current_spec(zone_seg);
-
-                spec.brightness = val;
-                if val > 0 && spec.off {
-                    spec.turn_on();
-                }
-
                 unsafe {
                     h.brightness_label.setStringValue(&NSString::from_str(&format!("{val}%")));
                 }
 
-                controller::schedule_live_led(target, spec);
+                Self::collect_and_schedule(h);
             }
         });
     }
@@ -689,18 +820,14 @@ impl PopoverPanel {
     fn dispatch_rate(val: u16) {
         HOLDER.with(|cell| {
             if let Some(h) = cell.borrow().as_ref() {
-                let zone_seg = unsafe { h.zone_control.selectedSegment() } as usize;
-                let target = Self::current_target_zone(zone_seg);
-                let mut spec = Self::current_spec(zone_seg);
-
-                spec.rate = Some(val.to_string());
-
+                let rounded = ((val + 50) / 100) * 100;
+                let rate_ms = rounded.clamp(1000, 10000);
+                let effect_seg = unsafe { h.effect_control.selectedSegment() } as usize;
                 unsafe {
-                    let sec = val as f32 / 1000.0;
-                    h.rate_label.setStringValue(&NSString::from_str(&format!("{sec:.1}s")));
+                    h.rate_label.setStringValue(&NSString::from_str(&Self::format_rate_label(rate_ms, effect_seg)));
                 }
 
-                controller::schedule_live_led(target, spec);
+                Self::collect_and_schedule(h);
             }
         });
     }
@@ -723,13 +850,25 @@ impl PopoverPanel {
     }
 
     pub fn sync_ui_from_config() {
+        let zone_seg = HOLDER.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map(|h| unsafe { h.zone_control.selectedSegment() } as usize)
+                .unwrap_or(0)
+        });
+        Self::sync_ui_from_config_for_zone(zone_seg);
+    }
+
+    pub fn sync_ui_from_config_for_zone(zone_seg: usize) {
         HOLDER.with(|cell| {
             if let Some(h) = cell.borrow().as_ref() {
-                let zone_seg = unsafe { h.zone_control.selectedSegment() } as usize;
                 let spec = Self::current_spec(zone_seg);
+                h.active_rgb.set(spec.rgb);
 
                 unsafe {
-                    let effect_idx = if spec.off {
+                    h.zone_control.setSelectedSegment(zone_seg as isize);
+
+                    let effect_idx: usize = if spec.off {
                         0
                     } else {
                         match spec.effect.as_str() {
@@ -738,15 +877,18 @@ impl PopoverPanel {
                             _ => 3, // breathing
                         }
                     };
-                    h.effect_control.setSelectedSegment(effect_idx);
+                    h.effect_control.setSelectedSegment(effect_idx as isize);
+
+                    Self::update_color_ui(&h.color_buttons, &h.color_label, spec.rgb, effect_idx);
 
                     h.brightness_slider.setDoubleValue(spec.brightness as f64);
                     h.brightness_label.setStringValue(&NSString::from_str(&format!("{}%", spec.brightness)));
 
-                    let period = led::rate_period_ms(spec.rate.as_deref()).unwrap_or(2000);
+                    let raw_period = led::rate_period_ms(spec.rate.as_deref()).unwrap_or(2000);
+                    let period = if raw_period == 0 { 2000 } else { raw_period.clamp(1000, 10000) };
                     h.rate_slider.setDoubleValue(period as f64);
-                    let sec = period as f32 / 1000.0;
-                    h.rate_label.setStringValue(&NSString::from_str(&format!("{sec:.1}s")));
+                    h.rate_slider.setEnabled(effect_idx == 2 || effect_idx == 3);
+                    h.rate_label.setStringValue(&NSString::from_str(&Self::format_rate_label(period, effect_idx)));
                 }
             }
         });

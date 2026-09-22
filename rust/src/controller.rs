@@ -273,3 +273,23 @@ pub fn schedule_live_led(target: TargetZone, spec: crate::config::LedSpec) {
     });
     cvar.notify_one();
 }
+
+/// 读取内存中尚未落盘或正在下发的最新灯效规格，避免 UI 在 200ms 防抖期内读到磁盘旧数据。
+pub fn get_live_spec_for_zone(zone_key: &str) -> Option<crate::config::LedSpec> {
+    let (lock, _) = get_live_channel();
+    let guard = lock.lock().ok()?;
+    let latest = guard
+        .pending_dispatch
+        .as_ref()
+        .or(guard.pending_persist.as_ref())?;
+    match latest.target {
+        TargetZone::All => Some(latest.spec.clone()),
+        TargetZone::Single(z) => {
+            if led::zone_key(z) == zone_key {
+                Some(latest.spec.clone())
+            } else {
+                None
+            }
+        }
+    }
+}
