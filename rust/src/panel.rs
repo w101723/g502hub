@@ -57,13 +57,20 @@ declare_class!(
     impl DeclaredClass for PanelDispatcher {}
 
     unsafe impl PanelDispatcher {
-        #[method(onDpiChanged:)]
-        fn on_dpi_changed(&self, sender: Option<&NSSegmentedControl>) {
+        #[method(onDpiSliderChanged:)]
+        fn on_dpi_slider_changed(&self, sender: Option<&NSSlider>) {
+            if let Some(slider) = sender {
+                let val = unsafe { slider.doubleValue() };
+                PopoverPanel::dispatch_dpi_slider(val);
+            }
+        }
+
+        #[method(onDpiPresetChanged:)]
+        fn on_dpi_preset_changed(&self, sender: Option<&NSSegmentedControl>) {
             if let Some(ctrl) = sender {
-                let seg = unsafe { ctrl.selectedSegment() };
-                let dpis = [400u16, 800, 1600, 3200];
-                if let Some(&dpi) = dpis.get(seg as usize) {
-                    PopoverPanel::dispatch_dpi(dpi);
+                let seg = unsafe { ctrl.selectedSegment() } as usize;
+                if let Some(&dpi) = PopoverPanel::DPI_PRESETS.get(seg) {
+                    PopoverPanel::dispatch_dpi_preset(dpi);
                 }
             }
         }
@@ -119,7 +126,10 @@ struct PanelHolder {
     panel: Retained<G502KeyPanel>,
     battery_label: Retained<NSTextField>,
     mode_label: Retained<NSTextField>,
-    dpi_control: Retained<NSSegmentedControl>,
+    dpi_value_label: Retained<NSTextField>,
+    dpi_slider: Retained<NSSlider>,
+    dpi_presets: Retained<NSSegmentedControl>,
+    active_dpi: Cell<u16>,
     zone_control: Retained<NSSegmentedControl>,
     effect_control: Retained<NSSegmentedControl>,
     color_label: Retained<NSTextField>,
@@ -142,9 +152,23 @@ static GLOBAL_MONITOR_RUNNING: AtomicBool = AtomicBool::new(false);
 pub struct PopoverPanel;
 
 impl PopoverPanel {
+    pub const DPI_PRESETS: &'static [u16] = &[400, 800, 1600, 3200, 6400];
+
+    pub fn slider_to_dpi(t: f64) -> u16 {
+        let t = t.clamp(0.0, 1.0);
+        let raw = 100.0 * (256.0_f64).powf(t);
+        let rounded = ((raw + 25.0) / 50.0).floor() as u32 * 50;
+        rounded.clamp(100, 25600) as u16
+    }
+
+    pub fn dpi_to_slider(dpi: u16) -> f64 {
+        let dpi = (dpi as f64).clamp(100.0, 25600.0);
+        ((dpi / 100.0).ln() / (256.0_f64).ln()).clamp(0.0, 1.0)
+    }
+
     pub fn init(mtm: MainThreadMarker) {
         let panel_width = 330.0;
-        let panel_height = 515.0;
+        let panel_height = 550.0;
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(panel_width, panel_height));
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::FullSizeContentView
@@ -241,30 +265,77 @@ impl PopoverPanel {
             root_stack.addArrangedSubview(&Self::create_separator(mtm));
         }
 
-        // 2. DPI 快捷切换卡片
+        // 2. DPI 调节卡片 (100 ~ 25600 滑块 + 实时数值 + 常用预设)
+        let dpi_header_row = unsafe { NSStackView::new(mtm) };
+        unsafe {
+            dpi_header_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+            dpi_header_row.setSpacing(8.0);
+        }
         let dpi_title = unsafe { NSTextField::labelWithString(&NSString::from_str("灵敏度 DPI"), mtm) };
         unsafe {
             dpi_title.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
-            root_stack.addArrangedSubview(&dpi_title);
+            dpi_header_row.addArrangedSubview(&dpi_title);
+        }
+        let dpi_value_label = unsafe { NSTextField::labelWithString(&NSString::from_str("1600 DPI"), mtm) };
+        unsafe {
+            dpi_value_label.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
+            dpi_value_label.setTextColor(Some(&NSColor::systemBlueColor()));
+            dpi_header_row.addArrangedSubview(&dpi_value_label);
+            root_stack.addArrangedSubview(&dpi_header_row);
         }
 
-        let dpi_labels = NSArray::from_vec(vec![
-            NSString::from_str("400"),
-            NSString::from_str("800"),
-            NSString::from_str("1600"),
-            NSString::from_str("3200"),
-        ]);
-        let dpi_control = unsafe {
-            NSSegmentedControl::segmentedControlWithLabels_trackingMode_target_action(
-                &dpi_labels,
-                NSSegmentSwitchTracking::SelectOne,
+        let dpi_slider_row = unsafe { NSStackView::new(mtm) };
+        unsafe {
+            dpi_slider_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+            dpi_slider_row.setSpacing(8.0);
+        }
+        let dpi_min_label = unsafe { NSTextField::labelWithString(&NSString::from_str("100"), mtm) };
+        unsafe {
+            dpi_min_label.setFont(Some(&NSFont::systemFontOfSize(10.0)));
+            dpi_min_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            dpi_slider_row.addArrangedSubview(&dpi_min_label);
+        }
+        let dpi_slider = unsafe {
+            NSSlider::sliderWithValue_minValue_maxValue_target_action(
+                Self::dpi_to_slider(1600),
+                0.0,
+                1.0,
                 Some(&dispatcher),
-                Some(sel!(onDpiChanged:)),
+                Some(sel!(onDpiSliderChanged:)),
                 mtm,
             )
         };
         unsafe {
-            root_stack.addArrangedSubview(&dpi_control);
+            dpi_slider.setContinuous(true);
+            dpi_slider_row.addArrangedSubview(&dpi_slider);
+        }
+        let dpi_max_label = unsafe { NSTextField::labelWithString(&NSString::from_str("25600"), mtm) };
+        unsafe {
+            dpi_max_label.setFont(Some(&NSFont::systemFontOfSize(10.0)));
+            dpi_max_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            dpi_slider_row.addArrangedSubview(&dpi_max_label);
+            root_stack.addArrangedSubview(&dpi_slider_row);
+        }
+
+        let dpi_preset_labels = NSArray::from_vec(vec![
+            NSString::from_str("400"),
+            NSString::from_str("800"),
+            NSString::from_str("1600"),
+            NSString::from_str("3200"),
+            NSString::from_str("6400"),
+        ]);
+        let dpi_presets = unsafe {
+            NSSegmentedControl::segmentedControlWithLabels_trackingMode_target_action(
+                &dpi_preset_labels,
+                NSSegmentSwitchTracking::SelectOne,
+                Some(&dispatcher),
+                Some(sel!(onDpiPresetChanged:)),
+                mtm,
+            )
+        };
+        unsafe {
+            dpi_presets.setSelectedSegment(2); // 1600
+            root_stack.addArrangedSubview(&dpi_presets);
             root_stack.addArrangedSubview(&Self::create_separator(mtm));
         }
 
@@ -450,7 +521,10 @@ impl PopoverPanel {
             panel,
             battery_label,
             mode_label,
-            dpi_control,
+            dpi_value_label,
+            dpi_slider,
+            dpi_presets,
+            active_dpi: Cell::new(1600),
             zone_control,
             effect_control,
             color_label,
@@ -715,15 +789,36 @@ impl PopoverPanel {
 
     // ---- 事件分发逻辑 ----
 
-    fn dispatch_dpi(dpi: u16) {
-        std::thread::spawn(move || {
-            if let Ok(dev) = crate::device::get_conn(2) {
-                if let Ok(actual) = controller::set_dpi_confirmed(&dev, dpi) {
-                    let _ = crate::config::update(|cfg| {
-                        cfg.desired_mode = crate::config::DesiredMode::Host;
-                        cfg.desired_dpi = Some(actual);
-                    });
+    fn dispatch_dpi_slider(t: f64) {
+        HOLDER.with(|cell| {
+            if let Some(h) = cell.borrow().as_ref() {
+                let dpi = Self::slider_to_dpi(t);
+                h.active_dpi.set(dpi);
+                unsafe {
+                    h.dpi_value_label.setStringValue(&NSString::from_str(&format!("{dpi} DPI")));
+                    if let Some(idx) = Self::DPI_PRESETS.iter().position(|&p| p == dpi) {
+                        h.dpi_presets.setSelectedSegment(idx as isize);
+                    } else {
+                        h.dpi_presets.setSelectedSegment(-1);
+                    }
                 }
+                controller::schedule_live_dpi(dpi);
+            }
+        });
+    }
+
+    fn dispatch_dpi_preset(dpi: u16) {
+        HOLDER.with(|cell| {
+            if let Some(h) = cell.borrow().as_ref() {
+                h.active_dpi.set(dpi);
+                unsafe {
+                    h.dpi_value_label.setStringValue(&NSString::from_str(&format!("{dpi} DPI")));
+                    h.dpi_slider.setDoubleValue(Self::dpi_to_slider(dpi));
+                    if let Some(idx) = Self::DPI_PRESETS.iter().position(|&p| p == dpi) {
+                        h.dpi_presets.setSelectedSegment(idx as isize);
+                    }
+                }
+                controller::schedule_live_dpi(dpi);
             }
         });
     }
@@ -839,9 +934,14 @@ impl PopoverPanel {
                     h.battery_label.setStringValue(&NSString::from_str(battery_text));
                     h.mode_label.setStringValue(&NSString::from_str(mode_text));
                     if let Some(d) = dpi {
-                        let dpis = [400u16, 800, 1600, 3200];
-                        if let Some(idx) = dpis.iter().position(|&x| x == d) {
-                            h.dpi_control.setSelectedSegment(idx as isize);
+                        let clamped = d.clamp(100, 25600);
+                        h.active_dpi.set(clamped);
+                        h.dpi_value_label.setStringValue(&NSString::from_str(&format!("{clamped} DPI")));
+                        h.dpi_slider.setDoubleValue(Self::dpi_to_slider(clamped));
+                        if let Some(idx) = Self::DPI_PRESETS.iter().position(|&p| p == clamped) {
+                            h.dpi_presets.setSelectedSegment(idx as isize);
+                        } else {
+                            h.dpi_presets.setSelectedSegment(-1);
                         }
                     }
                 }
@@ -862,6 +962,22 @@ impl PopoverPanel {
     pub fn sync_ui_from_config_for_zone(zone_seg: usize) {
         HOLDER.with(|cell| {
             if let Some(h) = cell.borrow().as_ref() {
+                // 同步 DPI 状态
+                let live_dpi = controller::get_live_dpi().or_else(|| {
+                    crate::config::load().ok().and_then(|c| c.desired_dpi)
+                }).unwrap_or(1600);
+                let clamped_dpi = live_dpi.clamp(100, 25600);
+                h.active_dpi.set(clamped_dpi);
+                unsafe {
+                    h.dpi_value_label.setStringValue(&NSString::from_str(&format!("{clamped_dpi} DPI")));
+                    h.dpi_slider.setDoubleValue(Self::dpi_to_slider(clamped_dpi));
+                    if let Some(idx) = Self::DPI_PRESETS.iter().position(|&p| p == clamped_dpi) {
+                        h.dpi_presets.setSelectedSegment(idx as isize);
+                    } else {
+                        h.dpi_presets.setSelectedSegment(-1);
+                    }
+                }
+
                 let spec = Self::current_spec(zone_seg);
                 h.active_rgb.set(spec.rgb);
 
@@ -892,5 +1008,36 @@ impl PopoverPanel {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dpi_slider_mapping_endpoints_and_presets() {
+        assert_eq!(PopoverPanel::slider_to_dpi(0.0), 100);
+        assert_eq!(PopoverPanel::slider_to_dpi(0.25), 400);
+        assert_eq!(PopoverPanel::slider_to_dpi(0.375), 800);
+        assert_eq!(PopoverPanel::slider_to_dpi(0.50), 1600);
+        assert_eq!(PopoverPanel::slider_to_dpi(0.625), 3200);
+        assert_eq!(PopoverPanel::slider_to_dpi(0.75), 6400);
+        assert_eq!(PopoverPanel::slider_to_dpi(1.0), 25600);
+
+        for &preset in PopoverPanel::DPI_PRESETS {
+            let t = PopoverPanel::dpi_to_slider(preset);
+            assert_eq!(PopoverPanel::slider_to_dpi(t), preset);
+        }
+    }
+
+    #[test]
+    fn test_dpi_slider_step_and_bounds() {
+        for step in 0..=1000 {
+            let t = step as f64 / 1000.0;
+            let dpi = PopoverPanel::slider_to_dpi(t);
+            assert!(dpi >= 100 && dpi <= 25600);
+            assert_eq!(dpi % 50, 0);
+        }
     }
 }

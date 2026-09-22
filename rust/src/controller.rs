@@ -293,3 +293,102 @@ pub fn get_live_spec_for_zone(zone_key: &str) -> Option<crate::config::LedSpec> 
         }
     }
 }
+
+// ---- DPI 实时合流与防抖落盘通道 ----
+
+#[derive(Clone)]
+struct PendingDpiUpdate {
+    dpi: u16,
+    updated_at: Instant,
+}
+
+struct LiveDpiState {
+    pending_dispatch: Option<PendingDpiUpdate>,
+    pending_persist: Option<PendingDpiUpdate>,
+}
+
+static LIVE_DPI: OnceLock<(Mutex<LiveDpiState>, Condvar)> = OnceLock::new();
+
+fn get_live_dpi_channel() -> &'static (Mutex<LiveDpiState>, Condvar) {
+    LIVE_DPI.get_or_init(|| {
+        let pair = (
+            Mutex::new(LiveDpiState {
+                pending_dispatch: None,
+                pending_persist: None,
+            }),
+            Condvar::new(),
+        );
+        std::thread::spawn(live_dpi_worker);
+        pair
+    })
+}
+
+fn live_dpi_worker() {
+    let (lock, cvar) = get_live_dpi_channel();
+    let mut guard = lock.lock().unwrap();
+    loop {
+        // 1. 优先下发最新待发 DPI
+        if let Some(cmd) = guard.pending_dispatch.take() {
+            guard.pending_persist = Some(cmd.clone());
+            drop(guard);
+
+            if let Ok(dev) = crate::device::get_conn(1) {
+                let _ = set_dpi_confirmed(&dev, cmd.dpi);
+            }
+
+            // 下发后做短暂合流保护（30ms），防止高频拖动冲垮固件
+            std::thread::sleep(Duration::from_millis(30));
+            guard = lock.lock().unwrap();
+            continue;
+        }
+
+        // 2. 检查 200ms 静止防抖落盘
+        if let Some(ref cur) = guard.pending_persist {
+            let elapsed = cur.updated_at.elapsed();
+            let debounce = Duration::from_millis(200);
+            if elapsed >= debounce {
+                let to_save = guard.pending_persist.take().unwrap();
+                drop(guard);
+
+                let _ = crate::config::update(|cfg| {
+                    cfg.desired_mode = crate::config::DesiredMode::Host;
+                    cfg.desired_dpi = Some(to_save.dpi);
+                });
+                guard = lock.lock().unwrap();
+            } else {
+                let remaining = debounce - elapsed;
+                let (new_guard, _) = cvar.wait_timeout(guard, remaining).unwrap();
+                guard = new_guard;
+            }
+            continue;
+        }
+
+        // 3. 休眠直到收到新指令
+        guard = cvar.wait(guard).unwrap();
+    }
+}
+
+/// 专供 UI DPI 滑块 / 预设快速点击使用的合流节流下发接口：
+/// - 极速响应：立即合流下发给设备；
+/// - 防抖落盘：滑动停止后自动持久化到配置；
+/// - 不阻塞当前线程。
+pub fn schedule_live_dpi(dpi: u16) {
+    let (lock, cvar) = get_live_dpi_channel();
+    let mut guard = lock.lock().unwrap();
+    guard.pending_dispatch = Some(PendingDpiUpdate {
+        dpi,
+        updated_at: Instant::now(),
+    });
+    cvar.notify_one();
+}
+
+/// 读取内存中尚未落盘或正在下发的最新 DPI，避免 UI 在 200ms 防抖期内读到磁盘旧数据。
+pub fn get_live_dpi() -> Option<u16> {
+    let (lock, _) = get_live_dpi_channel();
+    let guard = lock.lock().ok()?;
+    let latest = guard
+        .pending_dispatch
+        .as_ref()
+        .or(guard.pending_persist.as_ref())?;
+    Some(latest.dpi)
+}
