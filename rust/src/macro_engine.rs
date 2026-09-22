@@ -413,7 +413,11 @@ pub fn play(actions: &[Action]) -> Result<()> {
         if let Some(ms) = action.delay_ms {
             std::thread::sleep(std::time::Duration::from_millis(ms));
         } else if let Some(keys) = &action.keys {
-            tap_key(keys)?;
+            if keys == "action:battery" {
+                crate::menubar::dispatch_menu_action("macro:battery-status");
+            } else {
+                tap_key(keys)?;
+            }
         } else if let Some(text) = &action.text {
             type_text(text)?;
         } else if let Some(kc) = action.keycode {
@@ -615,6 +619,109 @@ pub fn is_tap_running() -> bool {
     global_tap().map(|t| t.is_running()).unwrap_or(false)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GKeyDef {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub desc: &'static str,
+    pub default_btn: u32,
+    pub is_battery_default: bool,
+}
+
+pub const G_KEYS: &[GKeyDef] = &[
+    GKeyDef { id: "mouse3",  name: "G4",  desc: "侧键·后退", default_btn: 3, is_battery_default: false },
+    GKeyDef { id: "mouse4",  name: "G5",  desc: "侧键·前进", default_btn: 4, is_battery_default: false },
+    GKeyDef { id: "mouse5",  name: "G6",  desc: "侧键·瞄准(DPI Shift)", default_btn: 5, is_battery_default: false },
+    GKeyDef { id: "mouse6",  name: "G7",  desc: "左键旁·后(DPI -)", default_btn: 6, is_battery_default: false },
+    GKeyDef { id: "mouse7",  name: "G8",  desc: "左键旁·前(DPI +)", default_btn: 7, is_battery_default: false },
+    GKeyDef { id: "mouse8",  name: "G9",  desc: "滚轮后·电量/模式", default_btn: 8, is_battery_default: true },
+    GKeyDef { id: "mouse9",  name: "G10", desc: "滚轮·向左倾斜", default_btn: 9, is_battery_default: false },
+    GKeyDef { id: "mouse10", name: "G11", desc: "滚轮·向右倾斜", default_btn: 10, is_battery_default: false },
+];
+
+pub fn get_gkey_by_id(id: &str) -> Option<&'static GKeyDef> {
+    G_KEYS.iter().find(|k| k.id == id || k.name.eq_ignore_ascii_case(id))
+}
+
+pub fn get_gkey_by_button(button: u32) -> Option<&'static GKeyDef> {
+    G_KEYS.iter().find(|k| k.default_btn == button)
+}
+
+pub fn default_battery_binding() -> MacroBinding {
+    MacroBinding {
+        name: Some("⚡️ 电池电量".into()),
+        enabled: true,
+        actions: vec![Action {
+            keys: Some("action:battery".into()),
+            text: None,
+            keycode: None,
+            delay_ms: None,
+            key_down: None,
+            modifiers: Vec::new(),
+        }],
+    }
+}
+
+pub fn get_binding_for_key(button_key: &str) -> Option<MacroBinding> {
+    if let Ok(cfg) = crate::config::load() {
+        if let Some(b) = cfg.macros.get(button_key) {
+            return Some(b.clone());
+        }
+    }
+    if button_key == "mouse8" || button_key.eq_ignore_ascii_case("g9") {
+        return Some(default_battery_binding());
+    }
+    None
+}
+
+pub fn get_binding_text(binding: &MacroBinding) -> Option<String> {
+    for a in &binding.actions {
+        if let Some(t) = &a.text {
+            return Some(t.clone());
+        }
+    }
+    None
+}
+
+pub fn save_text_binding(button_key: &str, text: &str) -> Result<()> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return clear_binding(button_key);
+    }
+    let binding = MacroBinding {
+        name: Some(format!("文字: \"{trimmed}\"")),
+        enabled: true,
+        actions: vec![Action {
+            keys: None,
+            text: Some(trimmed.to_string()),
+            keycode: None,
+            delay_ms: None,
+            key_down: None,
+            modifiers: Vec::new(),
+        }],
+    };
+    let macros = crate::config::update(|cfg| {
+        cfg.macros.insert(button_key.to_string(), binding);
+        cfg.macros.clone()
+    })?;
+    if let Some(tap) = global_tap() {
+        tap.update_bindings(macros);
+    }
+    Ok(())
+}
+
+pub fn save_battery_binding(button_key: &str) -> Result<()> {
+    let binding = default_battery_binding();
+    let macros = crate::config::update(|cfg| {
+        cfg.macros.insert(button_key.to_string(), binding);
+        cfg.macros.clone()
+    })?;
+    if let Some(tap) = global_tap() {
+        tap.update_bindings(macros);
+    }
+    Ok(())
+}
+
 pub fn clear_binding(button_key: &str) -> Result<()> {
     let macros = crate::config::update(|cfg| {
         cfg.macros.remove(button_key);
@@ -644,7 +751,11 @@ pub fn format_binding_summary(binding: &MacroBinding) -> String {
         .iter()
         .filter_map(|a| {
             if let Some(k) = &a.keys {
-                Some(k.clone())
+                if k == "action:battery" {
+                    Some("⚡️ 电池电量".into())
+                } else {
+                    Some(k.clone())
+                }
             } else if let Some(t) = &a.text {
                 Some(format!("\"{t}\""))
             } else {
@@ -1316,7 +1427,17 @@ unsafe fn tap_callback_inner(
         Ok(b) => b,
         Err(_) => return event,
     };
-    let Some(binding) = bindings_guard.get(key) else {
+    let binding = bindings_guard
+        .get(key)
+        .cloned()
+        .or_else(|| {
+            if button == 8 {
+                Some(default_battery_binding())
+            } else {
+                None
+            }
+        });
+    let Some(binding) = binding else {
         return event;
     };
     if !binding.enabled {
@@ -1501,5 +1622,42 @@ mod tests {
 
         LAST_BUTTON.store(-1, Ordering::Relaxed);
         assert_eq!(tap.last_button(), None);
+    }
+
+    #[test]
+    fn test_gkey_definitions_and_defaults() {
+        assert_eq!(G_KEYS.len(), 8);
+        assert_eq!(G_KEYS[0].name, "G4");
+        assert_eq!(G_KEYS[0].default_btn, 3);
+        assert_eq!(G_KEYS[5].name, "G9");
+        assert_eq!(G_KEYS[5].default_btn, 8);
+        assert!(G_KEYS[5].is_battery_default);
+
+        let g9 = get_gkey_by_id("g9").expect("find g9 by id");
+        assert_eq!(g9.default_btn, 8);
+        assert!(g9.is_battery_default);
+
+        let batt_binding = default_battery_binding();
+        assert!(batt_binding.enabled);
+        assert_eq!(batt_binding.actions[0].keys.as_deref(), Some("action:battery"));
+        assert_eq!(format_binding_summary(&batt_binding), "⚡️ 电池电量");
+    }
+
+    #[test]
+    fn test_text_binding_summary_and_extraction() {
+        let text_binding = MacroBinding {
+            name: Some("文字: \"hello world\"".into()),
+            enabled: true,
+            actions: vec![Action {
+                keys: None,
+                text: Some("hello world".into()),
+                keycode: None,
+                delay_ms: None,
+                key_down: None,
+                modifiers: Vec::new(),
+            }],
+        };
+        assert_eq!(get_binding_text(&text_binding), Some("hello world".to_string()));
+        assert_eq!(format_binding_summary(&text_binding), "文字: \"hello world\"");
     }
 }

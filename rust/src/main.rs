@@ -396,6 +396,22 @@ fn cmd_macro(action: &str, name: Option<String>) -> Result<()> {
             }
         }
     }
+    if action == "set-text" {
+        let Some(btn_arg) = name else {
+            bail!("用法: g502hub macro set-text \"<g4|mouse3|...> <文本内容>\"");
+        };
+        let mut parts = btn_arg.splitn(2, ' ');
+        let btn = parts.next().unwrap_or("");
+        let text = parts.next().unwrap_or("");
+        let key_id = if let Some(gk) = macro_engine::get_gkey_by_id(btn) {
+            gk.id
+        } else {
+            btn
+        };
+        macro_engine::save_text_binding(key_id, text)?;
+        println!("已保存 {key_id} 文字宏: {text}");
+        return Ok(());
+    }
     let Some(name) = name else {
         bail!("用法: g502hub macro test <mouse3|mouse4|…> 或 g502hub macro run")
     };

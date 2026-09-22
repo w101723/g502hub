@@ -8,18 +8,26 @@ use objc2::runtime::NSObject;
 use objc2::{declare_class, msg_send_id, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSBox, NSBoxType, NSButton, NSColor, NSControl, NSEvent,
-    NSFont, NSPanel, NSPopUpMenuWindowLevel, NSScreen, NSSegmentSwitchTracking,
-    NSSegmentedControl, NSSlider, NSStackView, NSTextField,
-    NSUserInterfaceLayoutOrientation, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowButton,
-    NSWindowCollectionBehavior, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSFont, NSImage, NSImageScaling, NSImageView, NSPanel, NSPopUpMenuWindowLevel, NSScreen,
+    NSSegmentSwitchTracking, NSSegmentedControl, NSSlider, NSStackView, NSTextField,
+    NSUserInterfaceLayoutOrientation, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindowButton, NSWindowCollectionBehavior,
+    NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSEdgeInsets, NSNotification, NSNotificationCenter, NSPoint, NSRect,
-    NSSize, NSString,
+    MainThreadMarker, NSArray, NSData, NSEdgeInsets, NSNotification, NSNotificationCenter, NSPoint,
+    NSRect, NSSize, NSString,
 };
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+const TOP_PNG: &[u8] = include_bytes!("../assets/g502_top.png");
+const SIDE_PNG: &[u8] = include_bytes!("../assets/g502_side.png");
+
+fn load_image(bytes: &[u8], mtm: MainThreadMarker) -> Option<Retained<NSImage>> {
+    let data = NSData::with_bytes(bytes);
+    NSImage::initWithData(mtm.alloc(), &data)
+}
 
 declare_class!(
     pub struct G502KeyPanel;
@@ -57,6 +65,22 @@ declare_class!(
     impl DeclaredClass for PanelDispatcher {}
 
     unsafe impl PanelDispatcher {
+        #[method(onMainTabChanged:)]
+        fn on_main_tab_changed(&self, sender: Option<&NSSegmentedControl>) {
+            if let Some(ctrl) = sender {
+                let seg = unsafe { ctrl.selectedSegment() } as usize;
+                PopoverPanel::switch_main_tab(seg);
+            }
+        }
+
+        #[method(onMouseViewChanged:)]
+        fn on_mouse_view_changed(&self, sender: Option<&NSSegmentedControl>) {
+            if let Some(ctrl) = sender {
+                let seg = unsafe { ctrl.selectedSegment() } as usize;
+                PopoverPanel::switch_mouse_view(seg);
+            }
+        }
+
         #[method(onDpiSliderChanged:)]
         fn on_dpi_slider_changed(&self, sender: Option<&NSSlider>) {
             if let Some(slider) = sender {
@@ -121,27 +145,43 @@ declare_class!(
             PopoverPanel::sync_macro_ui();
         }
 
-        #[method(onRecordG4:)]
-        fn on_record_g4(&self, _sender: Option<&NSButton>) {
-            crate::menubar::dispatch_menu_action("macro:record-g4");
-            PopoverPanel::sync_macro_ui();
+        #[method(onTextInputEnded:)]
+        fn on_text_input_ended(&self, sender: Option<&NSTextField>) {
+            if let Some(tf) = sender {
+                let tag = unsafe { tf.tag() } as usize;
+                if let Some(gk) = crate::macro_engine::G_KEYS.get(tag) {
+                    let text = unsafe { tf.stringValue() }.to_string();
+                    let _ = crate::macro_engine::save_text_binding(gk.id, &text);
+                    PopoverPanel::sync_macro_ui();
+                }
+            }
         }
 
-        #[method(onRecordG5:)]
-        fn on_record_g5(&self, _sender: Option<&NSButton>) {
-            crate::menubar::dispatch_menu_action("macro:record-g5");
-            PopoverPanel::sync_macro_ui();
+        #[method(onRecordGKey:)]
+        fn on_record_g_key(&self, sender: Option<&NSButton>) {
+            if let Some(btn) = sender {
+                let tag = unsafe { btn.tag() } as usize;
+                if let Some(gk) = crate::macro_engine::G_KEYS.get(tag) {
+                    crate::menubar::dispatch_menu_action(&format!("macro:record-{}", gk.id));
+                    PopoverPanel::sync_macro_ui();
+                }
+            }
         }
 
-        #[method(onClearG4:)]
-        fn on_clear_g4(&self, _sender: Option<&NSButton>) {
-            crate::menubar::dispatch_menu_action("macro:clear-g4");
-            PopoverPanel::sync_macro_ui();
+        #[method(onClearGKey:)]
+        fn on_clear_g_key(&self, sender: Option<&NSButton>) {
+            if let Some(btn) = sender {
+                let tag = unsafe { btn.tag() } as usize;
+                if let Some(gk) = crate::macro_engine::G_KEYS.get(tag) {
+                    crate::menubar::dispatch_menu_action(&format!("macro:clear-{}", gk.id));
+                    PopoverPanel::sync_macro_ui();
+                }
+            }
         }
 
-        #[method(onClearG5:)]
-        fn on_clear_g5(&self, _sender: Option<&NSButton>) {
-            crate::menubar::dispatch_menu_action("macro:clear-g5");
+        #[method(onDefaultBatteryG9:)]
+        fn on_default_battery_g9(&self, _sender: Option<&NSButton>) {
+            crate::menubar::dispatch_menu_action("macro:default-battery");
             PopoverPanel::sync_macro_ui();
         }
 
@@ -170,10 +210,23 @@ declare_class!(
     }
 );
 
+struct GKeyRow {
+    key_id: &'static str,
+    text_input: Retained<NSTextField>,
+    record_btn: Retained<NSButton>,
+    clear_btn: Retained<NSButton>,
+    _battery_btn: Option<Retained<NSButton>>,
+}
+
 struct PanelHolder {
     panel: Retained<G502KeyPanel>,
     battery_label: Retained<NSTextField>,
     mode_label: Retained<NSTextField>,
+    _tab_control: Retained<NSSegmentedControl>,
+    perf_stack: Retained<NSStackView>,
+    macro_stack: Retained<NSStackView>,
+
+    // 性能与灯效
     dpi_value_label: Retained<NSTextField>,
     dpi_slider: Retained<NSSlider>,
     dpi_presets: Retained<NSSegmentedControl>,
@@ -187,13 +240,14 @@ struct PanelHolder {
     rate_slider: Retained<NSSlider>,
     rate_label: Retained<NSTextField>,
     active_rgb: Cell<[u8; 3]>,
+
+    // 侧键宏
     macro_toggle_btn: Retained<NSButton>,
-    macro_g4_binding: Retained<NSTextField>,
-    macro_g4_record_btn: Retained<NSButton>,
-    macro_g4_clear_btn: Retained<NSButton>,
-    macro_g5_binding: Retained<NSTextField>,
-    macro_g5_record_btn: Retained<NSButton>,
-    macro_g5_clear_btn: Retained<NSButton>,
+    _mouse_view_control: Retained<NSSegmentedControl>,
+    mouse_image_view: Retained<NSImageView>,
+    top_image: Retained<NSImage>,
+    side_image: Retained<NSImage>,
+    gkey_rows: Vec<GKeyRow>,
     macro_status_label: Retained<NSTextField>,
     macro_rec_seq_btn: Retained<NSButton>,
     macro_rec_finish_btn: Retained<NSButton>,
@@ -226,8 +280,8 @@ impl PopoverPanel {
     }
 
     pub fn init(mtm: MainThreadMarker) {
-        let panel_width = 330.0;
-        let panel_height = 680.0;
+        let panel_width = 340.0;
+        let panel_height = 620.0;
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(panel_width, panel_height));
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::FullSizeContentView
@@ -283,11 +337,11 @@ impl PopoverPanel {
         let root_stack = unsafe { NSStackView::new(mtm) };
         unsafe {
             root_stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
-            root_stack.setSpacing(10.0);
+            root_stack.setSpacing(8.0);
             root_stack.setEdgeInsets(NSEdgeInsets {
-                top: 16.0,
+                top: 14.0,
                 left: 16.0,
-                bottom: 16.0,
+                bottom: 14.0,
                 right: 16.0,
             });
             root_stack.setFrame(NSRect::new(
@@ -321,7 +375,36 @@ impl PopoverPanel {
             mode_label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             mode_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
             root_stack.addArrangedSubview(&mode_label);
+        }
+
+        // 顶部选项卡：[ ⚡️ 性能与灯效 ] | [ 🖱️ 侧键宏 (G4-G11) ]
+        let tab_labels = NSArray::from_vec(vec![
+            NSString::from_str("⚡️ 性能与灯效"),
+            NSString::from_str("🖱️ 侧键宏 (G4-G11)"),
+        ]);
+        let tab_control = unsafe {
+            NSSegmentedControl::segmentedControlWithLabels_trackingMode_target_action(
+                &tab_labels,
+                NSSegmentSwitchTracking::SelectOne,
+                Some(&dispatcher),
+                Some(sel!(onMainTabChanged:)),
+                mtm,
+            )
+        };
+        unsafe {
+            tab_control.setSelectedSegment(0);
+            root_stack.addArrangedSubview(&tab_control);
             root_stack.addArrangedSubview(&Self::create_separator(mtm));
+        }
+
+        // ==================================================================== //
+        // TAB 1: 性能与灯效堆叠 (perf_stack)
+        // ==================================================================== //
+        let perf_stack = unsafe { NSStackView::new(mtm) };
+        unsafe {
+            perf_stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+            perf_stack.setSpacing(8.0);
+            root_stack.addArrangedSubview(&perf_stack);
         }
 
         // 2. DPI 调节卡片 (100 ~ 25600 滑块 + 实时数值 + 常用预设)
@@ -340,7 +423,7 @@ impl PopoverPanel {
             dpi_value_label.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
             dpi_value_label.setTextColor(Some(&NSColor::systemBlueColor()));
             dpi_header_row.addArrangedSubview(&dpi_value_label);
-            root_stack.addArrangedSubview(&dpi_header_row);
+            perf_stack.addArrangedSubview(&dpi_header_row);
         }
 
         let dpi_slider_row = unsafe { NSStackView::new(mtm) };
@@ -373,7 +456,7 @@ impl PopoverPanel {
             dpi_max_label.setFont(Some(&NSFont::systemFontOfSize(10.0)));
             dpi_max_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
             dpi_slider_row.addArrangedSubview(&dpi_max_label);
-            root_stack.addArrangedSubview(&dpi_slider_row);
+            perf_stack.addArrangedSubview(&dpi_slider_row);
         }
 
         let dpi_preset_labels = NSArray::from_vec(vec![
@@ -394,15 +477,15 @@ impl PopoverPanel {
         };
         unsafe {
             dpi_presets.setSelectedSegment(2); // 1600
-            root_stack.addArrangedSubview(&dpi_presets);
-            root_stack.addArrangedSubview(&Self::create_separator(mtm));
+            perf_stack.addArrangedSubview(&dpi_presets);
+            perf_stack.addArrangedSubview(&Self::create_separator(mtm));
         }
 
         // 3. RGB 分区选择卡片
         let rgb_title = unsafe { NSTextField::labelWithString(&NSString::from_str("RGB 分区控制"), mtm) };
         unsafe {
             rgb_title.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
-            root_stack.addArrangedSubview(&rgb_title);
+            perf_stack.addArrangedSubview(&rgb_title);
         }
 
         let zone_labels = NSArray::from_vec(vec![
@@ -421,7 +504,7 @@ impl PopoverPanel {
         };
         unsafe {
             zone_control.setSelectedSegment(0);
-            root_stack.addArrangedSubview(&zone_control);
+            perf_stack.addArrangedSubview(&zone_control);
         }
 
         // 4. 灯效模式切换
@@ -442,7 +525,7 @@ impl PopoverPanel {
         };
         unsafe {
             effect_control.setSelectedSegment(3); // 默认呼吸
-            root_stack.addArrangedSubview(&effect_control);
+            perf_stack.addArrangedSubview(&effect_control);
         }
 
         // 5. 颜色预设网格 (10 个颜色按钮 + 选定回显)
@@ -461,7 +544,7 @@ impl PopoverPanel {
             color_label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             color_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
             color_header.addArrangedSubview(&color_label);
-            root_stack.addArrangedSubview(&color_header);
+            perf_stack.addArrangedSubview(&color_header);
         }
 
         let color_row1 = unsafe { NSStackView::new(mtm) };
@@ -496,9 +579,9 @@ impl PopoverPanel {
             color_buttons.push(btn);
         }
         unsafe {
-            root_stack.addArrangedSubview(&color_row1);
-            root_stack.addArrangedSubview(&color_row2);
-            root_stack.addArrangedSubview(&Self::create_separator(mtm));
+            perf_stack.addArrangedSubview(&color_row1);
+            perf_stack.addArrangedSubview(&color_row2);
+            perf_stack.addArrangedSubview(&Self::create_separator(mtm));
         }
 
         // 6. 亮度调节滑块
@@ -530,7 +613,7 @@ impl PopoverPanel {
         unsafe {
             brightness_label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             bright_row.addArrangedSubview(&brightness_label);
-            root_stack.addArrangedSubview(&bright_row);
+            perf_stack.addArrangedSubview(&bright_row);
         }
 
         // 7. 速率调节滑块 (1000ms~10000ms / 1.0s~10.0s)
@@ -562,20 +645,27 @@ impl PopoverPanel {
         unsafe {
             rate_label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             rate_row.addArrangedSubview(&rate_label);
-            root_stack.addArrangedSubview(&rate_row);
+            perf_stack.addArrangedSubview(&rate_row);
         }
 
-        // 8. 侧键宏设置卡片
+        // ==================================================================== //
+        // TAB 2: 侧键宏堆叠 (macro_stack)
+        // ==================================================================== //
+        let macro_stack = unsafe { NSStackView::new(mtm) };
         unsafe {
-            root_stack.addArrangedSubview(&Self::create_separator(mtm));
+            macro_stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+            macro_stack.setSpacing(6.0);
+            macro_stack.setHidden(true); // 默认显示 Tab 0
+            root_stack.addArrangedSubview(&macro_stack);
         }
 
+        // 宏头部 (标题 + 引擎开关)
         let macro_header_row = unsafe { NSStackView::new(mtm) };
         unsafe {
             macro_header_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
             macro_header_row.setSpacing(8.0);
         }
-        let macro_title = unsafe { NSTextField::labelWithString(&NSString::from_str("侧键宏"), mtm) };
+        let macro_title = unsafe { NSTextField::labelWithString(&NSString::from_str("侧键宏设置"), mtm) };
         unsafe {
             macro_title.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
             macro_header_row.addArrangedSubview(&macro_title);
@@ -591,103 +681,143 @@ impl PopoverPanel {
         unsafe {
             macro_toggle_btn.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             macro_header_row.addArrangedSubview(&macro_toggle_btn);
-            root_stack.addArrangedSubview(&macro_header_row);
+            macro_stack.addArrangedSubview(&macro_header_row);
         }
 
-        // G4 (后退) 行
-        let g4_row = unsafe { NSStackView::new(mtm) };
-        unsafe {
-            g4_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
-            g4_row.setSpacing(6.0);
-        }
-        let g4_name = unsafe { NSTextField::labelWithString(&NSString::from_str("G4 (后退):"), mtm) };
-        unsafe {
-            g4_name.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-            g4_row.addArrangedSubview(&g4_name);
-        }
-        let macro_g4_binding = unsafe { NSTextField::labelWithString(&NSString::from_str("未绑定"), mtm) };
-        unsafe {
-            macro_g4_binding.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
-            macro_g4_binding.setTextColor(Some(&NSColor::secondaryLabelColor()));
-            g4_row.addArrangedSubview(&macro_g4_binding);
-        }
-        let macro_g4_record_btn = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("录制"),
+        // 鼠标透视选择器: [ 顶部按键 (G7..G11) ] | [ 侧面按键 (G4..G6) ]
+        let view_labels = NSArray::from_vec(vec![
+            NSString::from_str("顶部视角 (G7..G11)"),
+            NSString::from_str("侧面视角 (G4..G6)"),
+        ]);
+        let mouse_view_control = unsafe {
+            NSSegmentedControl::segmentedControlWithLabels_trackingMode_target_action(
+                &view_labels,
+                NSSegmentSwitchTracking::SelectOne,
                 Some(&dispatcher),
-                Some(sel!(onRecordG4:)),
+                Some(sel!(onMouseViewChanged:)),
                 mtm,
             )
         };
         unsafe {
-            macro_g4_record_btn.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-            g4_row.addArrangedSubview(&macro_g4_record_btn);
-        }
-        let macro_g4_clear_btn = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("清空"),
-                Some(&dispatcher),
-                Some(sel!(onClearG4:)),
-                mtm,
-            )
-        };
-        unsafe {
-            macro_g4_clear_btn.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-            g4_row.addArrangedSubview(&macro_g4_clear_btn);
-            root_stack.addArrangedSubview(&g4_row);
+            mouse_view_control.setSelectedSegment(0);
+            macro_stack.addArrangedSubview(&mouse_view_control);
         }
 
-        // G5 (前进) 行
-        let g5_row = unsafe { NSStackView::new(mtm) };
+        // 鼠标示意图 (120pt 高度)
+        let top_image = load_image(TOP_PNG, mtm).unwrap();
+        let side_image = load_image(SIDE_PNG, mtm).unwrap();
+        let mouse_image_view = unsafe { NSImageView::new(mtm) };
         unsafe {
-            g5_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
-            g5_row.setSpacing(6.0);
+            mouse_image_view.setImage(Some(&top_image));
+            mouse_image_view.setImageScaling(NSImageScaling::NSImageScaleProportionallyDown);
+            mouse_image_view.setFrame(NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(panel_width - 32.0, 115.0),
+            ));
+            macro_stack.addArrangedSubview(&mouse_image_view);
+            macro_stack.addArrangedSubview(&Self::create_separator(mtm));
         }
-        let g5_name = unsafe { NSTextField::labelWithString(&NSString::from_str("G5 (前进):"), mtm) };
-        unsafe {
-            g5_name.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-            g5_row.addArrangedSubview(&g5_name);
+
+        // G4 到 G11 独立按键行列表
+        let mut gkey_rows = Vec::new();
+        for (i, gk) in crate::macro_engine::G_KEYS.iter().enumerate() {
+            let row = unsafe { NSStackView::new(mtm) };
+            unsafe {
+                row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+                row.setSpacing(4.0);
+            }
+
+            let label_str = format!("{}:", gk.name);
+            let name_label = unsafe { NSTextField::labelWithString(&NSString::from_str(&label_str), mtm) };
+            unsafe {
+                name_label.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
+                row.addArrangedSubview(&name_label);
+            }
+
+            let text_input = unsafe { NSTextField::new(mtm) };
+            unsafe {
+                text_input.setEditable(true);
+                text_input.setSelectable(true);
+                text_input.setBezeled(true);
+                text_input.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+                text_input.setPlaceholderString(Some(&NSString::from_str(if gk.is_battery_default {
+                    "⚡️ 电池电量 (默认)"
+                } else {
+                    "输入自动打字文本..."
+                })));
+                text_input.setTarget(Some(&dispatcher));
+                text_input.setAction(Some(sel!(onTextInputEnded:)));
+                text_input.setTag(i as isize);
+                row.addArrangedSubview(&text_input);
+            }
+
+            let record_btn = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str("录制"),
+                    Some(&dispatcher),
+                    Some(sel!(onRecordGKey:)),
+                    mtm,
+                )
+            };
+            unsafe {
+                record_btn.setFont(Some(&NSFont::systemFontOfSize(10.5)));
+                record_btn.setTag(i as isize);
+                row.addArrangedSubview(&record_btn);
+            }
+
+            let mut battery_btn = None;
+            if gk.is_battery_default {
+                let btn = unsafe {
+                    NSButton::buttonWithTitle_target_action(
+                        &NSString::from_str("⚡️电量"),
+                        Some(&dispatcher),
+                        Some(sel!(onDefaultBatteryG9:)),
+                        mtm,
+                    )
+                };
+                unsafe {
+                    btn.setFont(Some(&NSFont::systemFontOfSize(10.5)));
+                    row.addArrangedSubview(&btn);
+                }
+                battery_btn = Some(btn);
+            }
+
+            let clear_btn = unsafe {
+                NSButton::buttonWithTitle_target_action(
+                    &NSString::from_str("清空"),
+                    Some(&dispatcher),
+                    Some(sel!(onClearGKey:)),
+                    mtm,
+                )
+            };
+            unsafe {
+                clear_btn.setFont(Some(&NSFont::systemFontOfSize(10.5)));
+                clear_btn.setTag(i as isize);
+                row.addArrangedSubview(&clear_btn);
+                macro_stack.addArrangedSubview(&row);
+            }
+
+            gkey_rows.push(GKeyRow {
+                key_id: gk.id,
+                text_input,
+                record_btn,
+                clear_btn,
+                _battery_btn: battery_btn,
+            });
         }
-        let macro_g5_binding = unsafe { NSTextField::labelWithString(&NSString::from_str("未绑定"), mtm) };
+
         unsafe {
-            macro_g5_binding.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
-            macro_g5_binding.setTextColor(Some(&NSColor::secondaryLabelColor()));
-            g5_row.addArrangedSubview(&macro_g5_binding);
-        }
-        let macro_g5_record_btn = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("录制"),
-                Some(&dispatcher),
-                Some(sel!(onRecordG5:)),
-                mtm,
-            )
-        };
-        unsafe {
-            macro_g5_record_btn.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-            g5_row.addArrangedSubview(&macro_g5_record_btn);
-        }
-        let macro_g5_clear_btn = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("清空"),
-                Some(&dispatcher),
-                Some(sel!(onClearG5:)),
-                mtm,
-            )
-        };
-        unsafe {
-            macro_g5_clear_btn.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-            g5_row.addArrangedSubview(&macro_g5_clear_btn);
-            root_stack.addArrangedSubview(&g5_row);
+            macro_stack.addArrangedSubview(&Self::create_separator(mtm));
         }
 
         // 宏状态提示
         let macro_status_label = unsafe {
-            NSTextField::labelWithString(&NSString::from_str("● 宏引擎就绪"), mtm)
+            NSTextField::labelWithString(&NSString::from_str("● 宏引擎就绪 (支持组合键与指定文字)"), mtm)
         };
         unsafe {
             macro_status_label.setFont(Some(&NSFont::systemFontOfSize(10.5)));
             macro_status_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
-            root_stack.addArrangedSubview(&macro_status_label);
+            macro_stack.addArrangedSubview(&macro_status_label);
         }
 
         // 宏录制辅助控制条
@@ -731,7 +861,7 @@ impl PopoverPanel {
         unsafe {
             macro_rec_cancel_btn.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             macro_action_row.addArrangedSubview(&macro_rec_cancel_btn);
-            root_stack.addArrangedSubview(&macro_action_row);
+            macro_stack.addArrangedSubview(&macro_action_row);
         }
 
         // 注册窗口失焦通知
@@ -749,6 +879,9 @@ impl PopoverPanel {
             panel,
             battery_label,
             mode_label,
+            _tab_control: tab_control,
+            perf_stack,
+            macro_stack,
             dpi_value_label,
             dpi_slider,
             dpi_presets,
@@ -763,12 +896,11 @@ impl PopoverPanel {
             rate_label,
             active_rgb: Cell::new([0, 200, 255]),
             macro_toggle_btn,
-            macro_g4_binding,
-            macro_g4_record_btn,
-            macro_g4_clear_btn,
-            macro_g5_binding,
-            macro_g5_record_btn,
-            macro_g5_clear_btn,
+            _mouse_view_control: mouse_view_control,
+            mouse_image_view,
+            top_image,
+            side_image,
+            gkey_rows,
             macro_status_label,
             macro_rec_seq_btn,
             macro_rec_finish_btn,
@@ -785,6 +917,37 @@ impl PopoverPanel {
         let sep = NSBox::new(mtm);
         sep.setBoxType(NSBoxType::NSBoxSeparator);
         sep
+    }
+
+    pub fn switch_main_tab(tab_idx: usize) {
+        HOLDER.with(|cell| {
+            if let Some(h) = cell.borrow().as_ref() {
+                if tab_idx == 0 {
+                    h.perf_stack.setHidden(false);
+                    h.macro_stack.setHidden(true);
+                } else {
+                    h.perf_stack.setHidden(true);
+                    h.macro_stack.setHidden(false);
+                }
+            }
+        });
+        if tab_idx == 1 {
+            Self::sync_macro_ui();
+        }
+    }
+
+    pub fn switch_mouse_view(view_idx: usize) {
+        HOLDER.with(|cell| {
+            if let Some(h) = cell.borrow().as_ref() {
+                unsafe {
+                    if view_idx == 0 {
+                        h.mouse_image_view.setImage(Some(&h.top_image));
+                    } else {
+                        h.mouse_image_view.setImage(Some(&h.side_image));
+                    }
+                }
+            }
+        });
     }
 
     /// 供后台线程发起请求，在主线程 pump 周期中弹出浮窗
@@ -1256,10 +1419,7 @@ impl PopoverPanel {
             if let Some(h) = cell.borrow().as_ref() {
                 let running = crate::macro_engine::is_tap_running();
                 let phase = crate::macro_engine::recording_phase();
-                let cfg = crate::config::load().unwrap_or_default();
-
-                let g4_binding = cfg.macros.get("mouse3");
-                let g5_binding = cfg.macros.get("mouse4");
+                let is_recording = !matches!(phase, crate::macro_engine::RecordingPhase::Idle);
 
                 unsafe {
                     if running {
@@ -1268,31 +1428,26 @@ impl PopoverPanel {
                         h.macro_toggle_btn.setTitle(&NSString::from_str("○ 宏引擎已停用"));
                     }
 
-                    let g4_summary = g4_binding
-                        .map(crate::macro_engine::format_binding_summary)
-                        .unwrap_or_else(|| "未绑定 (默认后退)".to_string());
-                    h.macro_g4_binding.setStringValue(&NSString::from_str(&g4_summary));
-                    if g4_binding.is_some() {
-                        h.macro_g4_binding.setTextColor(Some(&NSColor::systemBlueColor()));
-                    } else {
-                        h.macro_g4_binding.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                    for row in &h.gkey_rows {
+                        let binding = crate::macro_engine::get_binding_for_key(row.key_id);
+                        if let Some(b) = binding {
+                            if let Some(text) = crate::macro_engine::get_binding_text(&b) {
+                                row.text_input.setStringValue(&NSString::from_str(&text));
+                                row.text_input.setTextColor(Some(&NSColor::systemBlueColor()));
+                            } else {
+                                row.text_input.setStringValue(&NSString::from_str(""));
+                                let summary = crate::macro_engine::format_binding_summary(&b);
+                                row.text_input.setPlaceholderString(Some(&NSString::from_str(&summary)));
+                            }
+                            row.clear_btn.setEnabled(true);
+                        } else {
+                            row.text_input.setStringValue(&NSString::from_str(""));
+                            row.text_input.setPlaceholderString(Some(&NSString::from_str("输入自动打字文本...")));
+                            row.clear_btn.setEnabled(false);
+                        }
+                        row.record_btn.setEnabled(!is_recording);
                     }
-                    h.macro_g4_clear_btn.setEnabled(g4_binding.is_some());
 
-                    let g5_summary = g5_binding
-                        .map(crate::macro_engine::format_binding_summary)
-                        .unwrap_or_else(|| "未绑定 (默认前进)".to_string());
-                    h.macro_g5_binding.setStringValue(&NSString::from_str(&g5_summary));
-                    if g5_binding.is_some() {
-                        h.macro_g5_binding.setTextColor(Some(&NSColor::systemBlueColor()));
-                    } else {
-                        h.macro_g5_binding.setTextColor(Some(&NSColor::secondaryLabelColor()));
-                    }
-                    h.macro_g5_clear_btn.setEnabled(g5_binding.is_some());
-
-                    let is_recording = !matches!(phase, crate::macro_engine::RecordingPhase::Idle);
-                    h.macro_g4_record_btn.setEnabled(!is_recording);
-                    h.macro_g5_record_btn.setEnabled(!is_recording);
                     h.macro_rec_seq_btn.setEnabled(!is_recording);
                     h.macro_rec_cancel_btn.setEnabled(is_recording);
 
@@ -1302,31 +1457,27 @@ impl PopoverPanel {
                     let (status_text, is_warn) = match &phase {
                         crate::macro_engine::RecordingPhase::Idle => {
                             if running {
-                                ("● 宏引擎就绪 (按 G4/G5 侧键触发)".to_string(), false)
+                                ("● 宏引擎就绪 (支持组合键与指定文字)".to_string(), false)
                             } else {
-                                ("○ 宏引擎已停用 (点击开启以启用侧键拦截)".to_string(), false)
+                                ("○ 宏引擎已停用 (点击开启以启用按键拦截)".to_string(), false)
                             }
                         }
                         crate::macro_engine::RecordingPhase::AwaitMouse(crate::macro_engine::RecordingKind::Shortcut) => {
-                            ("👉 请按目标侧键 (G4 或 G5)...".to_string(), true)
+                            ("👉 请按目标侧键 (G4..G11)...".to_string(), true)
                         }
                         crate::macro_engine::RecordingPhase::AwaitMouse(crate::macro_engine::RecordingKind::Sequence) => {
                             ("👉 请按目标侧键开始录制序列...".to_string(), true)
                         }
                         crate::macro_engine::RecordingPhase::Shortcut { button } => {
-                            let name = match button {
-                                3 => "G4(后退)",
-                                4 => "G5(前进)",
-                                _ => "侧键",
-                            };
+                            let name = crate::macro_engine::get_gkey_by_button(*button)
+                                .map(|gk| format!("{}({})", gk.name, gk.desc))
+                                .unwrap_or_else(|| format!("button{button}"));
                             (format!("⌨️ 正在录制 {name}: 请按一次键盘快捷键..."), true)
                         }
                         crate::macro_engine::RecordingPhase::Sequence { button, events } => {
-                            let name = match button {
-                                3 => "G4(后退)",
-                                4 => "G5(前进)",
-                                _ => "侧键",
-                            };
+                            let name = crate::macro_engine::get_gkey_by_button(*button)
+                                .map(|gk| format!("{}({})", gk.name, gk.desc))
+                                .unwrap_or_else(|| format!("button{button}"));
                             (format!("🔴 录制中 {name}: 已捕获 {events} 个按键事件"), true)
                         }
                     };

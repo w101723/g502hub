@@ -150,12 +150,12 @@ impl Default for Config {
     fn default() -> Self {
         let mut macros = BTreeMap::new();
         macros.insert(
-            "mouse3".to_string(),
+            "mouse8".to_string(),
             MacroBinding {
-                name: Some("示例:复制".into()),
-                enabled: false,
+                name: Some("⚡️ 电池电量".into()),
+                enabled: true,
                 actions: vec![Action {
-                    keys: Some("cmd+c".into()),
+                    keys: Some("action:battery".into()),
                     text: None,
                     keycode: None,
                     delay_ms: None,

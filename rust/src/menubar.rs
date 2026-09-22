@@ -443,10 +443,10 @@ impl Core {
                 return;
             }
         }
-        let button_name = match button {
-            3 => "G4 (后退)",
-            4 => "G5 (前进)",
-            n => &format!("button{n}"),
+        let button_name = if let Some(gk) = crate::macro_engine::get_gkey_by_button(button) {
+            format!("{} ({})", gk.name, gk.desc)
+        } else {
+            format!("button{button}")
         };
         match self.tap.begin_recording_for_button(button, kind) {
             Ok(()) => self.notify(&format!("正在录制 {button_name}，请按一次键盘组合键")),
@@ -799,25 +799,55 @@ impl Core {
             ("macro", "record-sequence") => {
                 self.start_recording(RecordingKind::Sequence);
             }
-            ("macro", "record-g4") => {
-                self.start_recording_for_button(3, RecordingKind::Shortcut);
+            ("macro", arg) if arg.starts_with("record-") => {
+                let target = arg.trim_start_matches("record-");
+                if let Some(gk) = crate::macro_engine::get_gkey_by_id(target) {
+                    self.start_recording_for_button(gk.default_btn, RecordingKind::Shortcut);
+                } else if let Some(gk) = crate::macro_engine::G_KEYS.iter().find(|k| k.name.eq_ignore_ascii_case(target)) {
+                    self.start_recording_for_button(gk.default_btn, RecordingKind::Shortcut);
+                }
             }
-            ("macro", "record-g5") => {
-                self.start_recording_for_button(4, RecordingKind::Shortcut);
-            }
-            ("macro", "clear-g4") => {
-                let _ = crate::macro_engine::clear_binding("mouse3");
+            ("macro", arg) if arg.starts_with("clear-") => {
+                let target = arg.trim_start_matches("clear-");
+                let key_id = if let Some(gk) = crate::macro_engine::get_gkey_by_id(target) {
+                    gk.id
+                } else if let Some(gk) = crate::macro_engine::G_KEYS.iter().find(|k| k.name.eq_ignore_ascii_case(target)) {
+                    gk.id
+                } else {
+                    target
+                };
+                let _ = crate::macro_engine::clear_binding(key_id);
                 if let Ok(mut st) = self.state.lock() {
                     st.dirty = true;
                 }
-                self.notify("已清除 G4 (后退键) 宏绑定");
+                let name = crate::macro_engine::get_gkey_by_id(key_id)
+                    .map(|gk| format!("{} ({})", gk.name, gk.desc))
+                    .unwrap_or_else(|| key_id.to_string());
+                self.notify(&format!("已清除 {name} 宏绑定"));
             }
-            ("macro", "clear-g5") => {
-                let _ = crate::macro_engine::clear_binding("mouse4");
+            ("macro", "default-battery") => {
+                let _ = crate::macro_engine::save_battery_binding("mouse8");
                 if let Ok(mut st) = self.state.lock() {
                     st.dirty = true;
                 }
-                self.notify("已清除 G5 (前进键) 宏绑定");
+                self.notify("G9 已恢复默认: ⚡️ 电池电量");
+            }
+            ("macro", "battery-status") => {
+                let r = crate::device::get_conn(2).and_then(|dev| {
+                    crate::features::battery::read_battery(&dev)
+                });
+                match r {
+                    Ok(b) => {
+                        let volt = b.voltage_mv.map(|v| format!(" · {v}mV")).unwrap_or_default();
+                        let icon = if b.charging { "⚡️" } else { "🔋" };
+                        self.notify(&format!("{icon} G502 电量: {}% {}{volt}", b.percent, b.state_text));
+                        if let Ok(mut st) = self.state.lock() {
+                            st.snap.battery = Some(b);
+                            st.dirty = true;
+                        }
+                    }
+                    Err(e) => self.notify(&format!("读取电量失败: {e}")),
+                }
             }
             ("macro", "finish-recording") => {
                 if let Err(e) = self.tap.finish_sequence() {
@@ -1132,7 +1162,16 @@ pub fn run() -> Result<()> {
         config::load().map(|c| c.macros).unwrap_or_default()
     })));
     crate::macro_engine::set_global_tap(tap.clone());
-    if cfg.macros.values().any(|m| m.enabled) {
+
+    if !cfg.macros.contains_key("mouse8") {
+        let _ = crate::config::update(|c| {
+            c.macros.insert("mouse8".to_string(), crate::macro_engine::default_battery_binding());
+            c.macros.clone()
+        });
+    }
+
+    let cfg_latest = config::load().unwrap_or_else(|_| cfg.clone());
+    if cfg_latest.macros.values().any(|m| m.enabled) {
         let granted = accessibility_granted(false);
         crate::macro_engine::mlog(&format!(
             "menubar 启动:有启用宏,accessibility_granted={granted},尝试启动 tap"
