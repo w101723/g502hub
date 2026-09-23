@@ -16,9 +16,9 @@ cargo build --release --manifest-path rust/Cargo.toml
 
 echo "==> [2/4] 组装原生 .app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+rm -f "$APP/Contents/Resources/g502_top.png" "$APP/Contents/Resources/g502_side.png"
 cp "$BIN" "$APP/Contents/MacOS/g502hub"
 chmod 755 "$APP/Contents/MacOS/g502hub"
-cp -f assets/*.png "$APP/Contents/Resources/" 2>/dev/null || true
 python3 scripts/generate_app_icon.py >/dev/null
 ICONSET="$(mktemp -d)/AppIcon.iconset"
 mkdir -p "$ICONSET"

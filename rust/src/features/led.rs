@@ -155,22 +155,7 @@ impl<'a> Led<'a> {
     pub fn set_solid(&self, zone: u8, rgb: [u8; 3], brightness: u8) -> Result<(), HidppError> {
         let rgb = scale_rgb(rgb, brightness);
         let params: [u8; 16] = [
-            zone,
-            SLOT_SOLID,
-            rgb[0],
-            rgb[1],
-            rgb[2],
-            0x02,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
+            zone, SLOT_SOLID, rgb[0], rgb[1], rgb[2], 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
         self.send_f3(&params)
     }
@@ -250,21 +235,13 @@ impl<'a> Led<'a> {
         for attempt in 0..3 {
             match self.dev.request_long(self.index, 0x03, params) {
                 Ok(_) => return Ok(()),
-                Err(e) if attempt < 2 && is_transient_error(&e) => {
+                Err(e) if attempt < 2 && crate::hidpp::is_transient_error(&e) => {
                     std::thread::sleep(std::time::Duration::from_millis(40));
                 }
                 Err(e) => return Err(e),
             }
         }
         unreachable!()
-    }
-}
-
-fn is_transient_error(error: &HidppError) -> bool {
-    match error {
-        HidppError::Timeout(_) | HidppError::Io(_) => true,
-        HidppError::Rejected { code, .. } => matches!(*code, 0x04 | 0x07 | 0x09 | 0x0B),
-        HidppError::Open(_) | HidppError::Invalid(_) => false,
     }
 }
 
@@ -441,13 +418,17 @@ mod tests {
         assert_eq!(SLOT_SOLID, 1);
         assert_eq!(SLOT_CYCLE, 2);
         assert_eq!(SLOT_BREATHING, 3);
-        assert!(is_transient_error(&HidppError::Timeout("test".into())));
-        assert!(is_transient_error(&HidppError::Rejected {
+        assert!(crate::hidpp::is_transient_error(&HidppError::Timeout(
+            "test".into()
+        )));
+        assert!(crate::hidpp::is_transient_error(&HidppError::Rejected {
             code: 0x09,
             message: "busy".into(),
         }));
-        assert!(!is_transient_error(&HidppError::Invalid("bad".into())));
-        assert!(!is_transient_error(&HidppError::Rejected {
+        assert!(!crate::hidpp::is_transient_error(&HidppError::Invalid(
+            "bad".into()
+        )));
+        assert!(!crate::hidpp::is_transient_error(&HidppError::Rejected {
             code: 0x03,
             message: "invalid value".into(),
         }));

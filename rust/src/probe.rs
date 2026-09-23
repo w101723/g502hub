@@ -11,6 +11,7 @@ const KNOWN: &[(u16, &str)] = &[
     (0x1000, "BatteryStatus"),
     (0x1001, "BatteryVoltage"),
     (0x1004, "UnifiedBattery"),
+    (0x1300, "LedSoftwareControl"),
     (0x2200, "MousePointerBasic"),
     (0x2201, "AdjustableDPI"),
     (0x2202, "MouseButtonSpy"),
@@ -62,6 +63,66 @@ fn hex(data: &[u8]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// 0x1300 非 RGB 指示灯能力深探测(只读)。
+fn indicator_led_probe(dev: &G502Device) {
+    let root = dev.request(0x00, 0x00, &[0x13, 0x00, 0x00]);
+    println!(
+        "  Root.GetFeature(0x1300) → {}",
+        match root {
+            Ok(resp) => hex(&resp),
+            Err(e) => format!("✗ {e}"),
+        }
+    );
+    let Ok(idx) = dev.feature(0x1300) else {
+        return;
+    };
+    let count_response = dev
+        .transport
+        .request(dev.dev_index, idx, 0x00, &[], false, 800);
+    let count = match count_response {
+        Ok(resp) => {
+            println!("  0x1300 f0 GetLedCount → {}", hex(&resp));
+            resp.get(4).copied().unwrap_or(0)
+        }
+        Err(e) => {
+            println!("  0x1300 f0 GetLedCount → ✗ {e}");
+            return;
+        }
+    };
+    for led_index in 0..count {
+        let info = dev
+            .transport
+            .request(dev.dev_index, idx, 0x01, &[led_index], false, 800);
+        println!(
+            "  0x1300 f1 led{led_index} GetLedInfo → {}",
+            match info {
+                Ok(resp) => hex(&resp),
+                Err(e) => format!("✗ {e}"),
+            }
+        );
+        let state = dev
+            .transport
+            .request(dev.dev_index, idx, 0x04, &[led_index], true, 800);
+        println!(
+            "  0x1300 f4 led{led_index} GetLedState → {}",
+            match state {
+                Ok(resp) => hex(&resp),
+                Err(e) => format!("✗ {e}"),
+            }
+        );
+    }
+    let sw_ctrl = dev
+        .transport
+        .request(dev.dev_index, idx, 0x02, &[], false, 800);
+    println!(
+        "  0x1300 f2 GetSWCtrl → {}",
+        match sw_ctrl {
+            Ok(resp) => hex(&resp),
+            Err(e) => format!("✗ {e}"),
+        }
+    );
 }
 
 /// 0x8070 分区/效果能力深探测(只读):f1 逐分区、f2 逐效果。
@@ -142,6 +203,8 @@ pub fn run(what: &str) -> Result<()> {
     if what == "all" || what == "led" {
         raw_probe(&dev, 0x8070);
         led_deep_probe(&dev);
+        raw_probe(&dev, 0x1300);
+        indicator_led_probe(&dev);
         // 未知 feature 中可能与灯光管线相关的,一并探测
         raw_probe(&dev, 0x1EB0);
         raw_probe(&dev, 0x1863);

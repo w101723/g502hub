@@ -85,15 +85,24 @@ pub struct Profile {
     pub led: Option<LedSpec>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceAction {
+    #[serde(rename = "battery_level", alias = "battery")]
+    BatteryLevel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Action {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_action: Option<DeviceAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keycode: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_down: Option<bool>,
@@ -101,7 +110,21 @@ pub struct Action {
     pub modifiers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Default for Action {
+    fn default() -> Self {
+        Self {
+            device_action: None,
+            keys: None,
+            text: None,
+            keycode: None,
+            delay_ms: None,
+            key_down: None,
+            modifiers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MacroBinding {
     #[serde(default)]
     pub name: Option<String>,
@@ -146,32 +169,61 @@ fn default_threshold() -> u8 {
     15
 }
 
+impl Config {
+    pub fn migrate_legacy(&mut self) -> bool {
+        let mut modified = false;
+        for binding in self.macros.values_mut() {
+            let mut had_battery = false;
+            for action in &mut binding.actions {
+                if action.keys.as_deref() == Some("action:battery") {
+                    action.device_action = Some(DeviceAction::BatteryLevel);
+                    action.keys = None;
+                    modified = true;
+                    had_battery = true;
+                } else if action.device_action == Some(DeviceAction::BatteryLevel) {
+                    had_battery = true;
+                }
+            }
+            if had_battery && binding.name.as_deref() == Some("⚡️ 电池电量") {
+                binding.name = Some("设备动作 · 电池电量".into());
+                modified = true;
+            }
+        }
+        modified
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let mut macros = BTreeMap::new();
         macros.insert(
             "mouse8".to_string(),
             MacroBinding {
-                name: Some("⚡️ 电池电量".into()),
+                name: Some("设备动作 · 电池电量".into()),
                 enabled: true,
                 actions: vec![Action {
-                    keys: Some("action:battery".into()),
-                    text: None,
-                    keycode: None,
-                    delay_ms: None,
-                    key_down: None,
-                    modifiers: Vec::new(),
+                    device_action: Some(DeviceAction::BatteryLevel),
+                    ..Action::default()
                 }],
             },
         );
         let profiles = BTreeMap::new();
+        let mut led_zones = BTreeMap::new();
+        led_zones.insert(
+            "primary".into(),
+            LedSpec::new("breathing", [255, 204, 0], 100, Some("2000")),
+        );
+        led_zones.insert(
+            "logo".into(),
+            LedSpec::new("breathing", [0, 200, 255], 100, Some("2000")),
+        );
         Config {
             desired_mode: DesiredMode::Host,
             desired_dpi: None,
             dpi_levels: default_dpi_levels(),
             profiles,
             macros,
-            led_zones: BTreeMap::new(),
+            led_zones,
             battery_poll_seconds: default_poll(),
             low_battery_threshold: default_threshold(),
         }
@@ -194,8 +246,11 @@ fn load_unlocked() -> Result<Config> {
     }
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("读取 {}", path.display()))?;
-    let cfg: Config =
+    let mut cfg: Config =
         serde_json::from_str(&text).with_context(|| format!("解析 {}", path.display()))?;
+    if cfg.migrate_legacy() {
+        save_unlocked(&cfg)?;
+    }
     Ok(cfg)
 }
 
@@ -318,6 +373,7 @@ mod tests {
     #[test]
     fn test_recorded_action_round_trip() {
         let action = Action {
+            device_action: None,
             keys: None,
             text: None,
             keycode: Some(8),
@@ -330,6 +386,124 @@ mod tests {
         assert_eq!(decoded.keycode, Some(8));
         assert_eq!(decoded.key_down, Some(true));
         assert_eq!(decoded.modifiers, vec!["cmd", "shift"]);
+    }
+
+    #[test]
+    fn test_device_action_round_trip() {
+        let action = Action {
+            device_action: Some(DeviceAction::BatteryLevel),
+            ..Action::default()
+        };
+        let serialized = serde_json::to_string(&action).unwrap();
+        assert!(serialized.contains("battery_level"));
+        let decoded: Action = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(decoded.device_action, Some(DeviceAction::BatteryLevel));
+        assert_eq!(decoded.keys, None);
+
+        // also test alias "battery"
+        let alias_json = r#"{"device_action":"battery"}"#;
+        let decoded_alias: Action = serde_json::from_str(alias_json).unwrap();
+        assert_eq!(
+            decoded_alias.device_action,
+            Some(DeviceAction::BatteryLevel)
+        );
+    }
+
+    #[test]
+    fn test_migrate_legacy_battery_action() {
+        let legacy_json = r#"{
+            "macros": {
+                "mouse8": {
+                    "name": "⚡️ 电池电量",
+                    "enabled": true,
+                    "actions": [
+                        {"keys": "action:battery"}
+                    ]
+                }
+            }
+        }"#;
+        let mut cfg: Config = serde_json::from_str(legacy_json).unwrap();
+        assert!(cfg.migrate_legacy());
+        let m8 = cfg.macros.get("mouse8").unwrap();
+        assert_eq!(m8.name.as_deref(), Some("设备动作 · 电池电量"));
+        assert_eq!(
+            m8.actions[0].device_action,
+            Some(DeviceAction::BatteryLevel)
+        );
+        assert_eq!(m8.actions[0].keys, None);
+
+        // Migrating again does not re-modify
+        assert!(!cfg.migrate_legacy());
+    }
+
+    #[test]
+    fn test_default_config_uses_typed_battery_action() {
+        let cfg = Config::default();
+        let m8 = cfg.macros.get("mouse8").unwrap();
+        assert_eq!(m8.name.as_deref(), Some("设备动作 · 电池电量"));
+        assert_eq!(
+            m8.actions[0].device_action,
+            Some(DeviceAction::BatteryLevel)
+        );
+        assert_eq!(m8.actions[0].keys, None);
+    }
+
+    #[test]
+    fn test_migrate_mixed_macros() {
+        let json = r#"{
+            "macros": {
+                "mouse3": {
+                    "name": "快捷键",
+                    "enabled": true,
+                    "actions": [{"keys": "cmd+c"}]
+                },
+                "mouse4": {
+                    "name": "文本",
+                    "enabled": true,
+                    "actions": [{"text": "hello"}]
+                },
+                "mouse8": {
+                    "name": "⚡️ 电池电量",
+                    "enabled": true,
+                    "actions": [{"keys": "action:battery"}]
+                }
+            }
+        }"#;
+        let mut cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.migrate_legacy());
+
+        // mouse3 is preserved
+        let m3 = cfg.macros.get("mouse3").unwrap();
+        assert_eq!(m3.actions[0].keys.as_deref(), Some("cmd+c"));
+        assert_eq!(m3.actions[0].device_action, None);
+
+        // mouse4 is preserved
+        let m4 = cfg.macros.get("mouse4").unwrap();
+        assert_eq!(m4.actions[0].text.as_deref(), Some("hello"));
+        assert_eq!(m4.actions[0].device_action, None);
+
+        // mouse8 is migrated
+        let m8 = cfg.macros.get("mouse8").unwrap();
+        assert_eq!(m8.name.as_deref(), Some("设备动作 · 电池电量"));
+        assert_eq!(
+            m8.actions[0].device_action,
+            Some(DeviceAction::BatteryLevel)
+        );
+        assert_eq!(m8.actions[0].keys, None);
+    }
+
+    #[test]
+    fn test_config_round_trip_with_device_action() {
+        let cfg = Config::default();
+        let serialized = serde_json::to_string_pretty(&cfg).unwrap();
+        assert!(serialized.contains("battery_level"));
+        let deserialized: Config = serde_json::from_str(&serialized).unwrap();
+        let m8 = deserialized.macros.get("mouse8").unwrap();
+        assert_eq!(
+            m8.actions[0].device_action,
+            Some(DeviceAction::BatteryLevel)
+        );
+        assert_eq!(m8.actions[0].keys, None);
     }
 
     #[test]

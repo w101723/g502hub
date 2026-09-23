@@ -13,7 +13,6 @@ use crate::device::{
 };
 use crate::features::battery::{read_battery, BatteryInfo};
 use crate::features::dpi::Dpi;
-use crate::features::led::Led;
 use crate::features::onboard::OnboardMode;
 use crate::macro_engine::{
     accessibility_granted, recording_outcome_pending, recording_phase, recording_serial,
@@ -38,10 +37,10 @@ use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 static QUIT: AtomicBool = AtomicBool::new(false);
 static ACTION_TX: std::sync::OnceLock<mpsc::Sender<String>> = std::sync::OnceLock::new();
 
-pub fn dispatch_menu_action(id: &str) {
-    if let Some(tx) = ACTION_TX.get() {
-        let _ = tx.send(id.to_string());
-    }
+pub fn dispatch_menu_action(id: &str) -> bool {
+    ACTION_TX
+        .get()
+        .is_some_and(|tx| tx.send(id.to_string()).is_ok())
 }
 
 /// 菜单预设色(任意颜色走"自定义颜色…"调起系统取色器)。
@@ -300,7 +299,10 @@ impl App {
             .as_ref()
             .map(|b| {
                 let icon = if b.charging { "⚡️" } else { "🔋" };
-                let volt = b.voltage_mv.map(|v| format!(" · {v}mV")).unwrap_or_default();
+                let volt = b
+                    .voltage_mv
+                    .map(|v| format!(" · {v}mV"))
+                    .unwrap_or_default();
                 format!("{icon} {}% {}{volt}", b.percent, b.state_text)
             })
             .unwrap_or_else(|| "🔋 未连接".into());
@@ -720,14 +722,7 @@ impl Core {
                         .map(|v| Dpi::new(&dev).and_then(|d| d.set_dpi(v)))
                         .transpose()?;
                     if let Some(led) = &p.led {
-                        let l = Led::new(&dev)?;
-                        if led.off {
-                            l.set_off(0)?;
-                        } else {
-                            let period = crate::features::led::rate_period_ms(led.rate.as_deref())
-                                .unwrap_or(0);
-                            l.set_effect(0, &led.effect, led.rgb, led.brightness, period)?;
-                        }
+                        controller::apply_led_spec(&dev, crate::features::led::ZONE_PRIMARY, led)?;
                     }
                     Ok((mode, dpi))
                 });
@@ -803,7 +798,10 @@ impl Core {
                 let target = arg.trim_start_matches("record-");
                 if let Some(gk) = crate::macro_engine::get_gkey_by_id(target) {
                     self.start_recording_for_button(gk.default_btn, RecordingKind::Shortcut);
-                } else if let Some(gk) = crate::macro_engine::G_KEYS.iter().find(|k| k.name.eq_ignore_ascii_case(target)) {
+                } else if let Some(gk) = crate::macro_engine::G_KEYS
+                    .iter()
+                    .find(|k| k.name.eq_ignore_ascii_case(target))
+                {
                     self.start_recording_for_button(gk.default_btn, RecordingKind::Shortcut);
                 }
             }
@@ -811,7 +809,10 @@ impl Core {
                 let target = arg.trim_start_matches("clear-");
                 let key_id = if let Some(gk) = crate::macro_engine::get_gkey_by_id(target) {
                     gk.id
-                } else if let Some(gk) = crate::macro_engine::G_KEYS.iter().find(|k| k.name.eq_ignore_ascii_case(target)) {
+                } else if let Some(gk) = crate::macro_engine::G_KEYS
+                    .iter()
+                    .find(|k| k.name.eq_ignore_ascii_case(target))
+                {
                     gk.id
                 } else {
                     target
@@ -830,24 +831,32 @@ impl Core {
                 if let Ok(mut st) = self.state.lock() {
                     st.dirty = true;
                 }
-                self.notify("G9 已恢复默认: ⚡️ 电池电量");
+                self.notify("G9 已恢复默认: 设备动作 · 电池电量");
             }
             ("macro", "battery-status") => {
-                let r = crate::device::get_conn(2).and_then(|dev| {
-                    crate::features::battery::read_battery(&dev)
-                });
-                match r {
-                    Ok(b) => {
-                        let volt = b.voltage_mv.map(|v| format!(" · {v}mV")).unwrap_or_default();
-                        let icon = if b.charging { "⚡️" } else { "🔋" };
-                        self.notify(&format!("{icon} G502 电量: {}% {}{volt}", b.percent, b.state_text));
-                        if let Ok(mut st) = self.state.lock() {
-                            st.snap.battery = Some(b);
-                            st.dirty = true;
+                let state = self.state.clone();
+                std::thread::spawn(move || {
+                    let result = crate::device::get_conn(2).and_then(|dev| {
+                        let battery = crate::features::battery::read_battery(&dev)?;
+                        let cfg = crate::config::load()
+                            .map_err(|e| crate::hidpp::HidppError::Invalid(e.to_string()))?;
+                        crate::features::battery_indicator::show_battery_level(
+                            &dev,
+                            battery.percent,
+                            &cfg,
+                        )?;
+                        Ok(battery)
+                    });
+                    match result {
+                        Ok(battery) => {
+                            if let Ok(mut st) = state.lock() {
+                                st.snap.battery = Some(battery);
+                                st.dirty = true;
+                            }
                         }
+                        Err(e) => crate::macro_engine::mlog(&format!("G9 机身电量指示失败: {e}")),
                     }
-                    Err(e) => self.notify(&format!("读取电量失败: {e}")),
-                }
+                });
             }
             ("macro", "finish-recording") => {
                 if let Err(e) = self.tap.finish_sequence() {
@@ -910,7 +919,19 @@ impl Core {
                 }
                 let _ = std::process::Command::new("open").arg(&path).spawn();
             }
-            ("app", "quit") => QUIT.store(true, Ordering::Relaxed),
+            ("app", "quit") => {
+                if let Ok(dev) = crate::device::get_conn(0) {
+                    let _ = controller::with_device_lock(|| {
+                        if let Ok(indicator) =
+                            crate::features::indicator_led::IndicatorLed::new(&dev)
+                        {
+                            let _ = indicator.release();
+                        }
+                        Ok(())
+                    });
+                }
+                QUIT.store(true, Ordering::Relaxed);
+            }
             _ => {}
         }
         if let Ok(mut st) = self.state.lock() {
@@ -1038,6 +1059,17 @@ fn publish_battery(state: &Arc<Mutex<State>>, desc: String, battery: BatteryInfo
     }
 }
 
+fn publish_partial(state: &Arc<Mutex<State>>, desc: String, battery: BatteryInfo) {
+    if let Ok(mut st) = state.lock() {
+        st.snap.device_desc = Some(desc);
+        st.snap.battery = Some(battery);
+        st.snap.dpi = None;
+        st.snap.mode = None;
+        st.snap.error = None;
+        st.dirty = true;
+    }
+}
+
 fn publish_offline(state: &Arc<Mutex<State>>, error: String) {
     if let Ok(mut st) = state.lock() {
         st.snap.device_desc = None;
@@ -1047,6 +1079,10 @@ fn publish_offline(state: &Arc<Mutex<State>>, error: String) {
         st.snap.error = Some(error);
         st.dirty = true;
     }
+}
+
+fn keep_online_after_battery_failure(failures: u8, interface_present: bool) -> bool {
+    failures < 2 && interface_present
 }
 
 fn wait_with_interface_watch(dev: &G502Device, seconds: u64) -> bool {
@@ -1067,6 +1103,8 @@ fn poll_loop(state: Arc<Mutex<State>>, led_sync_pending: Arc<AtomicBool>) {
     const SYSTEM_WAKE_GAP: Duration = Duration::from_secs(15);
     let mut active: Option<Arc<G502Device>> = None;
     let mut desc = String::new();
+    let mut battery_failures = 0u8;
+    let mut state_sync_pending = false;
     let mut last_iteration = Instant::now();
     loop {
         if last_iteration.elapsed() >= SYSTEM_WAKE_GAP {
@@ -1079,10 +1117,27 @@ fn poll_loop(state: Arc<Mutex<State>>, led_sync_pending: Arc<AtomicBool>) {
         if let Some(dev) = active.clone() {
             match read_battery(&dev) {
                 Ok(battery) => {
+                    battery_failures = 0;
                     next_delay = 5;
-                    publish_battery(&state, desc.clone(), battery);
+                    publish_battery(&state, desc.clone(), battery.clone());
+                    if state_sync_pending {
+                        match controller::apply_desired_all(&dev, &cfg) {
+                            Ok((applied, led_synced)) => {
+                                publish_connected(
+                                    &state,
+                                    desc.clone(),
+                                    battery,
+                                    applied.dpi,
+                                    applied.mode,
+                                );
+                                state_sync_pending = false;
+                                led_sync_pending.store(!led_synced, Ordering::Release);
+                            }
+                            Err(e) => eprintln!("设备状态同步失败，将重试: {e}"),
+                        }
+                    }
                     let pending = led_sync_pending.load(Ordering::Acquire);
-                    if cfg.desired_mode == DesiredMode::Host && pending {
+                    if !state_sync_pending && cfg.desired_mode == DesiredMode::Host && pending {
                         let latest = config::load().unwrap_or(cfg);
                         match controller::apply_desired_led(&dev, &latest) {
                             Ok(()) => {
@@ -1096,37 +1151,62 @@ fn poll_loop(state: Arc<Mutex<State>>, led_sync_pending: Arc<AtomicBool>) {
                     }
                 }
                 Err(e) => {
-                    active = None;
-                    led_sync_pending.store(true, Ordering::Release);
-                    let present = g502_interface_present().unwrap_or(true);
-                    next_delay = if present { 10 } else { 2 };
-                    publish_offline(&state, e.to_string());
+                    battery_failures = battery_failures.saturating_add(1);
+                    eprintln!("电量轮询失败 ({battery_failures}/2): {e}");
+                    if keep_online_after_battery_failure(
+                        battery_failures,
+                        g502_interface_present().unwrap_or(true),
+                    ) {
+                        next_delay = 1;
+                    } else {
+                        active = None;
+                        battery_failures = 0;
+                        state_sync_pending = false;
+                        led_sync_pending.store(true, Ordering::Release);
+                        invalidate_connection();
+                        next_delay = 2;
+                        publish_offline(&state, e.to_string());
+                    }
                 }
             }
         } else {
             match crate::device::get_conn(0).and_then(|dev| {
-                let (applied, led_synced) = controller::apply_desired_all(&dev, &cfg)?;
-                if cfg.desired_dpi.is_none() && applied.mode == OnboardMode::Host {
-                    if let Some(current_dpi) = applied.dpi {
-                        let _ = config::update(|latest| {
-                            latest.desired_dpi = Some(current_dpi);
-                        });
-                    }
-                }
                 let device_desc = crate::device::describe(&dev);
                 let battery = read_battery(&dev)?;
+                let applied = controller::apply_desired_all(&dev, &cfg);
+                let (applied, led_synced) = match applied {
+                    Ok(value) => (Some(value.0), value.1),
+                    Err(e) => {
+                        eprintln!("设备在线，状态同步稍后重试: {e}");
+                        (None, false)
+                    }
+                };
+                if let Some(applied) = applied {
+                    if cfg.desired_dpi.is_none() && applied.mode == OnboardMode::Host {
+                        if let Some(current_dpi) = applied.dpi {
+                            let _ = config::update(|latest| {
+                                latest.desired_dpi = Some(current_dpi);
+                            });
+                        }
+                    }
+                }
                 Ok((dev, device_desc, battery, applied, led_synced))
             }) {
                 Ok((dev, device_desc, battery, applied, led_synced)) => {
-                    next_delay = 5;
+                    next_delay = if applied.is_some() { 5 } else { 2 };
                     desc = device_desc;
+                    state_sync_pending = applied.is_none();
                     led_sync_pending.store(!led_synced, Ordering::Release);
-                    publish_connected(&state, desc.clone(), battery, applied.dpi, applied.mode);
+                    if let Some(applied) = applied {
+                        publish_connected(&state, desc.clone(), battery, applied.dpi, applied.mode);
+                    } else {
+                        publish_partial(&state, desc.clone(), battery);
+                    }
                     active = Some(dev);
                 }
                 Err(e) => {
-                    let present = g502_interface_present().unwrap_or(true);
-                    next_delay = if present { 10 } else { 2 };
+                    eprintln!("设备连接失败，将重试: {e}");
+                    next_delay = 2;
                     publish_offline(&state, e.to_string());
                 }
             }
@@ -1135,12 +1215,27 @@ fn poll_loop(state: Arc<Mutex<State>>, led_sync_pending: Arc<AtomicBool>) {
         if let Some(dev) = active.clone() {
             if !wait_with_interface_watch(&dev, next_delay) {
                 active = None;
+                battery_failures = 0;
+                state_sync_pending = false;
+                led_sync_pending.store(true, Ordering::Release);
                 invalidate_connection();
                 publish_offline(&state, "G502 USB 连接已变化，正在重新连接".into());
             }
         } else {
             std::thread::sleep(Duration::from_secs(next_delay));
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::keep_online_after_battery_failure;
+
+    #[test]
+    fn temporary_battery_failure_keeps_device_visible() {
+        assert!(keep_online_after_battery_failure(1, true));
+        assert!(!keep_online_after_battery_failure(2, true));
+        assert!(!keep_online_after_battery_failure(1, false));
     }
 }
 
@@ -1163,15 +1258,7 @@ pub fn run() -> Result<()> {
     })));
     crate::macro_engine::set_global_tap(tap.clone());
 
-    if !cfg.macros.contains_key("mouse8") {
-        let _ = crate::config::update(|c| {
-            c.macros.insert("mouse8".to_string(), crate::macro_engine::default_battery_binding());
-            c.macros.clone()
-        });
-    }
-
-    let cfg_latest = config::load().unwrap_or_else(|_| cfg.clone());
-    if cfg_latest.macros.values().any(|m| m.enabled) {
+    if cfg.macros.values().any(|m| m.enabled) {
         let granted = accessibility_granted(false);
         crate::macro_engine::mlog(&format!(
             "menubar 启动:有启用宏,accessibility_granted={granted},尝试启动 tap"
@@ -1327,7 +1414,13 @@ extern "C" fn pump_callback(_timer: CFRunLoopTimerRef, info: *mut std::ffi::c_vo
     // 1. 托盘点击事件：左键弹出/收起 PopoverPanel (只响应 Down 避免双触发)
     let tray_receiver = TrayIconEvent::receiver();
     while let Ok(ev) = tray_receiver.try_recv() {
-        if let TrayIconEvent::Click { button, rect, button_state, .. } = ev {
+        if let TrayIconEvent::Click {
+            button,
+            rect,
+            button_state,
+            ..
+        } = ev
+        {
             if button == MouseButton::Left && button_state == tray_icon::MouseButtonState::Down {
                 crate::panel::PopoverPanel::toggle_at(Some(rect));
             }

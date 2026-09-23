@@ -2,32 +2,25 @@
 
 use crate::controller::{self, TargetZone};
 use crate::features::led;
+use crate::mouse_canvas::{CanvasMode, G502MouseCanvas};
 use objc2::mutability::MainThreadOnly;
 use objc2::rc::Retained;
 use objc2::runtime::NSObject;
 use objc2::{declare_class, msg_send_id, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSBox, NSBoxType, NSButton, NSColor, NSControl, NSEvent,
-    NSFont, NSImage, NSImageScaling, NSImageView, NSPanel, NSPopUpMenuWindowLevel, NSScreen,
-    NSSegmentSwitchTracking, NSSegmentedControl, NSSlider, NSStackView, NSTextField,
-    NSUserInterfaceLayoutOrientation, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindowButton, NSWindowCollectionBehavior,
-    NSWindowStyleMask, NSWindowTitleVisibility,
+    NSFont, NSPanel, NSPopUpMenuWindowLevel, NSScreen, NSScrollView, NSSegmentSwitchTracking,
+    NSSegmentedControl, NSSlider, NSStackView, NSTextField, NSUserInterfaceLayoutOrientation,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindowButton, NSWindowCollectionBehavior, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSData, NSEdgeInsets, NSNotification, NSNotificationCenter, NSPoint,
-    NSRect, NSSize, NSString,
+    MainThreadMarker, NSArray, NSEdgeInsets, NSNotification, NSNotificationCenter, NSPoint, NSRect,
+    NSSize, NSString,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-const TOP_PNG: &[u8] = include_bytes!("../assets/g502_top.png");
-const SIDE_PNG: &[u8] = include_bytes!("../assets/g502_side.png");
-
-fn load_image(bytes: &[u8], mtm: MainThreadMarker) -> Option<Retained<NSImage>> {
-    let data = NSData::with_bytes(bytes);
-    NSImage::initWithData(mtm.alloc(), &data)
-}
 
 declare_class!(
     pub struct G502KeyPanel;
@@ -150,6 +143,7 @@ declare_class!(
             if let Some(tf) = sender {
                 let tag = unsafe { tf.tag() } as usize;
                 if let Some(gk) = crate::macro_engine::G_KEYS.get(tag) {
+                    PopoverPanel::select_gkey(gk.id, false);
                     let text = unsafe { tf.stringValue() }.to_string();
                     let _ = crate::macro_engine::save_text_binding(gk.id, &text);
                     PopoverPanel::sync_macro_ui();
@@ -162,6 +156,7 @@ declare_class!(
             if let Some(btn) = sender {
                 let tag = unsafe { btn.tag() } as usize;
                 if let Some(gk) = crate::macro_engine::G_KEYS.get(tag) {
+                    PopoverPanel::select_gkey(gk.id, false);
                     crate::menubar::dispatch_menu_action(&format!("macro:record-{}", gk.id));
                     PopoverPanel::sync_macro_ui();
                 }
@@ -173,6 +168,7 @@ declare_class!(
             if let Some(btn) = sender {
                 let tag = unsafe { btn.tag() } as usize;
                 if let Some(gk) = crate::macro_engine::G_KEYS.get(tag) {
+                    PopoverPanel::select_gkey(gk.id, false);
                     crate::menubar::dispatch_menu_action(&format!("macro:clear-{}", gk.id));
                     PopoverPanel::sync_macro_ui();
                 }
@@ -181,6 +177,7 @@ declare_class!(
 
         #[method(onDefaultBatteryG9:)]
         fn on_default_battery_g9(&self, _sender: Option<&NSButton>) {
+            PopoverPanel::select_gkey("mouse8", false);
             crate::menubar::dispatch_menu_action("macro:default-battery");
             PopoverPanel::sync_macro_ui();
         }
@@ -212,6 +209,7 @@ declare_class!(
 
 struct GKeyRow {
     key_id: &'static str,
+    summary_label: Retained<NSTextField>,
     text_input: Retained<NSTextField>,
     record_btn: Retained<NSButton>,
     clear_btn: Retained<NSButton>,
@@ -243,10 +241,8 @@ struct PanelHolder {
 
     // 侧键宏
     macro_toggle_btn: Retained<NSButton>,
-    _mouse_view_control: Retained<NSSegmentedControl>,
-    mouse_image_view: Retained<NSImageView>,
-    top_image: Retained<NSImage>,
-    side_image: Retained<NSImage>,
+    mouse_view_control: Retained<NSSegmentedControl>,
+    mouse_canvas: Retained<G502MouseCanvas>,
     gkey_rows: Vec<GKeyRow>,
     macro_status_label: Retained<NSTextField>,
     macro_rec_seq_btn: Retained<NSButton>,
@@ -282,7 +278,10 @@ impl PopoverPanel {
     pub fn init(mtm: MainThreadMarker) {
         let panel_width = 340.0;
         let panel_height = 620.0;
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(panel_width, panel_height));
+        let frame = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(panel_width, panel_height),
+        );
         let style = NSWindowStyleMask::Titled
             | NSWindowStyleMask::FullSizeContentView
             | NSWindowStyleMask::NonactivatingPanel;
@@ -315,7 +314,8 @@ impl PopoverPanel {
             if let Some(btn) = panel.standardWindowButton(NSWindowButton::NSWindowCloseButton) {
                 btn.setHidden(true);
             }
-            if let Some(btn) = panel.standardWindowButton(NSWindowButton::NSWindowMiniaturizeButton) {
+            if let Some(btn) = panel.standardWindowButton(NSWindowButton::NSWindowMiniaturizeButton)
+            {
                 btn.setHidden(true);
             }
             if let Some(btn) = panel.standardWindowButton(NSWindowButton::NSWindowZoomButton) {
@@ -357,12 +357,14 @@ impl PopoverPanel {
             header_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
             header_row.setSpacing(8.0);
         }
-        let title_label = unsafe { NSTextField::labelWithString(&NSString::from_str("G502 LIGHTSPEED"), mtm) };
+        let title_label =
+            unsafe { NSTextField::labelWithString(&NSString::from_str("G502 LIGHTSPEED"), mtm) };
         unsafe {
             title_label.setFont(Some(&NSFont::boldSystemFontOfSize(14.0)));
             header_row.addArrangedSubview(&title_label);
         }
-        let battery_label = unsafe { NSTextField::labelWithString(&NSString::from_str("🔋 --%"), mtm) };
+        let battery_label =
+            unsafe { NSTextField::labelWithString(&NSString::from_str("🔋 --%"), mtm) };
         unsafe {
             battery_label.setFont(Some(&NSFont::systemFontOfSize(12.0)));
             header_row.addArrangedSubview(&battery_label);
@@ -370,7 +372,9 @@ impl PopoverPanel {
         }
 
         // 模式状态
-        let mode_label = unsafe { NSTextField::labelWithString(&NSString::from_str("控制模式: 主机控制"), mtm) };
+        let mode_label = unsafe {
+            NSTextField::labelWithString(&NSString::from_str("控制模式: 主机控制"), mtm)
+        };
         unsafe {
             mode_label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             mode_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
@@ -413,12 +417,14 @@ impl PopoverPanel {
             dpi_header_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
             dpi_header_row.setSpacing(8.0);
         }
-        let dpi_title = unsafe { NSTextField::labelWithString(&NSString::from_str("灵敏度 DPI"), mtm) };
+        let dpi_title =
+            unsafe { NSTextField::labelWithString(&NSString::from_str("灵敏度 DPI"), mtm) };
         unsafe {
             dpi_title.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
             dpi_header_row.addArrangedSubview(&dpi_title);
         }
-        let dpi_value_label = unsafe { NSTextField::labelWithString(&NSString::from_str("1600 DPI"), mtm) };
+        let dpi_value_label =
+            unsafe { NSTextField::labelWithString(&NSString::from_str("1600 DPI"), mtm) };
         unsafe {
             dpi_value_label.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
             dpi_value_label.setTextColor(Some(&NSColor::systemBlueColor()));
@@ -431,7 +437,8 @@ impl PopoverPanel {
             dpi_slider_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
             dpi_slider_row.setSpacing(8.0);
         }
-        let dpi_min_label = unsafe { NSTextField::labelWithString(&NSString::from_str("100"), mtm) };
+        let dpi_min_label =
+            unsafe { NSTextField::labelWithString(&NSString::from_str("100"), mtm) };
         unsafe {
             dpi_min_label.setFont(Some(&NSFont::systemFontOfSize(10.0)));
             dpi_min_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
@@ -451,7 +458,8 @@ impl PopoverPanel {
             dpi_slider.setContinuous(true);
             dpi_slider_row.addArrangedSubview(&dpi_slider);
         }
-        let dpi_max_label = unsafe { NSTextField::labelWithString(&NSString::from_str("25600"), mtm) };
+        let dpi_max_label =
+            unsafe { NSTextField::labelWithString(&NSString::from_str("25600"), mtm) };
         unsafe {
             dpi_max_label.setFont(Some(&NSFont::systemFontOfSize(10.0)));
             dpi_max_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
@@ -482,7 +490,8 @@ impl PopoverPanel {
         }
 
         // 3. RGB 分区选择卡片
-        let rgb_title = unsafe { NSTextField::labelWithString(&NSString::from_str("RGB 分区控制"), mtm) };
+        let rgb_title =
+            unsafe { NSTextField::labelWithString(&NSString::from_str("RGB 分区控制"), mtm) };
         unsafe {
             rgb_title.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
             perf_stack.addArrangedSubview(&rgb_title);
@@ -534,12 +543,14 @@ impl PopoverPanel {
             color_header.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
             color_header.setSpacing(6.0);
         }
-        let color_title = unsafe { NSTextField::labelWithString(&NSString::from_str("预设色彩"), mtm) };
+        let color_title =
+            unsafe { NSTextField::labelWithString(&NSString::from_str("预设色彩"), mtm) };
         unsafe {
             color_title.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
             color_header.addArrangedSubview(&color_title);
         }
-        let color_label = unsafe { NSTextField::labelWithString(&NSString::from_str("选定色彩: --"), mtm) };
+        let color_label =
+            unsafe { NSTextField::labelWithString(&NSString::from_str("选定色彩: --"), mtm) };
         unsafe {
             color_label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             color_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
@@ -572,9 +583,13 @@ impl PopoverPanel {
                 btn.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             }
             if i < 5 {
-                unsafe { color_row1.addArrangedSubview(&btn); }
+                unsafe {
+                    color_row1.addArrangedSubview(&btn);
+                }
             } else {
-                unsafe { color_row2.addArrangedSubview(&btn); }
+                unsafe {
+                    color_row2.addArrangedSubview(&btn);
+                }
             }
             color_buttons.push(btn);
         }
@@ -590,7 +605,8 @@ impl PopoverPanel {
             bright_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
             bright_row.setSpacing(8.0);
         }
-        let bright_title = unsafe { NSTextField::labelWithString(&NSString::from_str("亮度:"), mtm) };
+        let bright_title =
+            unsafe { NSTextField::labelWithString(&NSString::from_str("亮度:"), mtm) };
         unsafe {
             bright_title.setFont(Some(&NSFont::systemFontOfSize(12.0)));
             bright_row.addArrangedSubview(&bright_title);
@@ -609,7 +625,8 @@ impl PopoverPanel {
             brightness_slider.setContinuous(true);
             bright_row.addArrangedSubview(&brightness_slider);
         }
-        let brightness_label = unsafe { NSTextField::labelWithString(&NSString::from_str("100%"), mtm) };
+        let brightness_label =
+            unsafe { NSTextField::labelWithString(&NSString::from_str("100%"), mtm) };
         unsafe {
             brightness_label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             bright_row.addArrangedSubview(&brightness_label);
@@ -622,7 +639,8 @@ impl PopoverPanel {
             rate_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
             rate_row.setSpacing(8.0);
         }
-        let rate_title = unsafe { NSTextField::labelWithString(&NSString::from_str("速率:"), mtm) };
+        let rate_title =
+            unsafe { NSTextField::labelWithString(&NSString::from_str("速率:"), mtm) };
         unsafe {
             rate_title.setFont(Some(&NSFont::systemFontOfSize(12.0)));
             rate_row.addArrangedSubview(&rate_title);
@@ -641,7 +659,8 @@ impl PopoverPanel {
             rate_slider.setContinuous(true);
             rate_row.addArrangedSubview(&rate_slider);
         }
-        let rate_label = unsafe { NSTextField::labelWithString(&NSString::from_str("2.0s (中)"), mtm) };
+        let rate_label =
+            unsafe { NSTextField::labelWithString(&NSString::from_str("2.0s (中)"), mtm) };
         unsafe {
             rate_label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
             rate_row.addArrangedSubview(&rate_label);
@@ -665,7 +684,8 @@ impl PopoverPanel {
             macro_header_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
             macro_header_row.setSpacing(8.0);
         }
-        let macro_title = unsafe { NSTextField::labelWithString(&NSString::from_str("侧键宏设置"), mtm) };
+        let macro_title =
+            unsafe { NSTextField::labelWithString(&NSString::from_str("侧键宏设置"), mtm) };
         unsafe {
             macro_title.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
             macro_header_row.addArrangedSubview(&macro_title);
@@ -703,22 +723,45 @@ impl PopoverPanel {
             macro_stack.addArrangedSubview(&mouse_view_control);
         }
 
-        // 鼠标示意图 (120pt 高度)
-        let top_image = load_image(TOP_PNG, mtm).unwrap();
-        let side_image = load_image(SIDE_PNG, mtm).unwrap();
-        let mouse_image_view = unsafe { NSImageView::new(mtm) };
-        unsafe {
-            mouse_image_view.setImage(Some(&top_image));
-            mouse_image_view.setImageScaling(NSImageScaling::NSImageScaleProportionallyDown);
-            mouse_image_view.setFrame(NSRect::new(
+        // 原生交互矢量画布:悬停/点击可识别 G4-G11,不依赖静态图片。
+        let mouse_canvas = G502MouseCanvas::new(
+            NSRect::new(
                 NSPoint::new(0.0, 0.0),
-                NSSize::new(panel_width - 32.0, 115.0),
-            ));
-            macro_stack.addArrangedSubview(&mouse_image_view);
+                NSSize::new(panel_width - 32.0, 142.0),
+            ),
+            mtm,
+        );
+        unsafe {
+            macro_stack.addArrangedSubview(&mouse_canvas);
             macro_stack.addArrangedSubview(&Self::create_separator(mtm));
         }
 
-        // G4 到 G11 独立按键行列表
+        // G4 到 G11 独立按键行列表。使用滚动区，避免矢量图与八行配置挤出面板。
+        let macro_rows_stack = unsafe { NSStackView::new(mtm) };
+        unsafe {
+            macro_rows_stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+            macro_rows_stack.setSpacing(5.0);
+            macro_rows_stack.setFrame(NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(panel_width - 48.0, 360.0),
+            ));
+        }
+        let macro_scroll = unsafe {
+            NSScrollView::initWithFrame(
+                mtm.alloc(),
+                NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(panel_width - 32.0, 210.0),
+                ),
+            )
+        };
+        unsafe {
+            macro_scroll.setHasVerticalScroller(true);
+            macro_scroll.setDrawsBackground(false);
+            macro_scroll.setDocumentView(Some(&macro_rows_stack));
+            macro_stack.addArrangedSubview(&macro_scroll);
+        }
+
         let mut gkey_rows = Vec::new();
         for (i, gk) in crate::macro_engine::G_KEYS.iter().enumerate() {
             let row = unsafe { NSStackView::new(mtm) };
@@ -728,10 +771,25 @@ impl PopoverPanel {
             }
 
             let label_str = format!("{}:", gk.name);
-            let name_label = unsafe { NSTextField::labelWithString(&NSString::from_str(&label_str), mtm) };
+            let name_label =
+                unsafe { NSTextField::labelWithString(&NSString::from_str(&label_str), mtm) };
             unsafe {
                 name_label.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
                 row.addArrangedSubview(&name_label);
+            }
+
+            let editor_stack = unsafe { NSStackView::new(mtm) };
+            unsafe {
+                editor_stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+                editor_stack.setSpacing(1.0);
+            }
+
+            let summary_label =
+                unsafe { NSTextField::labelWithString(&NSString::from_str("未绑定"), mtm) };
+            unsafe {
+                summary_label.setFont(Some(&NSFont::systemFontOfSize(9.5)));
+                summary_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                editor_stack.addArrangedSubview(&summary_label);
             }
 
             let text_input = unsafe { NSTextField::new(mtm) };
@@ -740,15 +798,12 @@ impl PopoverPanel {
                 text_input.setSelectable(true);
                 text_input.setBezeled(true);
                 text_input.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-                text_input.setPlaceholderString(Some(&NSString::from_str(if gk.is_battery_default {
-                    "⚡️ 电池电量 (默认)"
-                } else {
-                    "输入自动打字文本..."
-                })));
+                text_input.setPlaceholderString(Some(&NSString::from_str("输入自动打字文本...")));
                 text_input.setTarget(Some(&dispatcher));
                 text_input.setAction(Some(sel!(onTextInputEnded:)));
                 text_input.setTag(i as isize);
-                row.addArrangedSubview(&text_input);
+                editor_stack.addArrangedSubview(&text_input);
+                row.addArrangedSubview(&editor_stack);
             }
 
             let record_btn = unsafe {
@@ -769,7 +824,7 @@ impl PopoverPanel {
             if gk.is_battery_default {
                 let btn = unsafe {
                     NSButton::buttonWithTitle_target_action(
-                        &NSString::from_str("⚡️电量"),
+                        &NSString::from_str("恢复电量"),
                         Some(&dispatcher),
                         Some(sel!(onDefaultBatteryG9:)),
                         mtm,
@@ -794,11 +849,12 @@ impl PopoverPanel {
                 clear_btn.setFont(Some(&NSFont::systemFontOfSize(10.5)));
                 clear_btn.setTag(i as isize);
                 row.addArrangedSubview(&clear_btn);
-                macro_stack.addArrangedSubview(&row);
+                macro_rows_stack.addArrangedSubview(&row);
             }
 
             gkey_rows.push(GKeyRow {
                 key_id: gk.id,
+                summary_label,
                 text_input,
                 record_btn,
                 clear_btn,
@@ -812,7 +868,10 @@ impl PopoverPanel {
 
         // 宏状态提示
         let macro_status_label = unsafe {
-            NSTextField::labelWithString(&NSString::from_str("● 宏引擎就绪 (支持组合键与指定文字)"), mtm)
+            NSTextField::labelWithString(
+                &NSString::from_str("● 宏引擎就绪 (支持组合键与指定文字)"),
+                mtm,
+            )
         };
         unsafe {
             macro_status_label.setFont(Some(&NSFont::systemFontOfSize(10.5)));
@@ -896,10 +955,8 @@ impl PopoverPanel {
             rate_label,
             active_rgb: Cell::new([0, 200, 255]),
             macro_toggle_btn,
-            _mouse_view_control: mouse_view_control,
-            mouse_image_view,
-            top_image,
-            side_image,
+            mouse_view_control,
+            mouse_canvas,
             gkey_rows,
             macro_status_label,
             macro_rec_seq_btn,
@@ -939,11 +996,40 @@ impl PopoverPanel {
     pub fn switch_mouse_view(view_idx: usize) {
         HOLDER.with(|cell| {
             if let Some(h) = cell.borrow().as_ref() {
+                h.mouse_canvas.set_mode(if view_idx == 0 {
+                    CanvasMode::Top
+                } else {
+                    CanvasMode::Side
+                });
+            }
+        });
+    }
+
+    fn gkey_name_for_id(key_id: &str) -> Option<&'static str> {
+        crate::macro_engine::get_gkey_by_id(key_id).map(|gk| gk.name)
+    }
+
+    pub(crate) fn select_gkey(key_id: &str, focus_editor: bool) {
+        HOLDER.with(|cell| {
+            if let Some(h) = cell.borrow().as_ref() {
+                let Some(gk) = crate::macro_engine::get_gkey_by_id(key_id) else {
+                    return;
+                };
+                let top = matches!(gk.name, "G7" | "G8" | "G9" | "G10" | "G11");
+                let segment = if top { 0 } else { 1 };
                 unsafe {
-                    if view_idx == 0 {
-                        h.mouse_image_view.setImage(Some(&h.top_image));
-                    } else {
-                        h.mouse_image_view.setImage(Some(&h.side_image));
+                    h.mouse_view_control.setSelectedSegment(segment);
+                }
+                h.mouse_canvas.set_mode(if top {
+                    CanvasMode::Top
+                } else {
+                    CanvasMode::Side
+                });
+                h.mouse_canvas.set_selected_key(Some(gk.name.to_string()));
+
+                if focus_editor {
+                    if let Some(row) = h.gkey_rows.iter().find(|row| row.key_id == gk.id) {
+                        h.panel.makeFirstResponder(Some(&row.text_input));
                     }
                 }
             }
@@ -986,12 +1072,20 @@ impl PopoverPanel {
                 let (origin_x, origin_y) = if let Some(rect) = tray_rect {
                     let screen_frame = NSScreen::mainScreen(MainThreadMarker::from(&*h.panel))
                         .map(|s| s.visibleFrame())
-                        .unwrap_or(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0)));
+                        .unwrap_or(NSRect::new(
+                            NSPoint::new(0.0, 0.0),
+                            NSSize::new(1440.0, 900.0),
+                        ));
 
-                    let mut x = rect.position.x + (rect.size.width as f64 / 2.0) - (panel_frame.size.width / 2.0);
-                    let mut y = screen_frame.origin.y + screen_frame.size.height - panel_frame.size.height - 4.0;
+                    let mut x = rect.position.x + (rect.size.width as f64 / 2.0)
+                        - (panel_frame.size.width / 2.0);
+                    let mut y = screen_frame.origin.y + screen_frame.size.height
+                        - panel_frame.size.height
+                        - 4.0;
 
-                    let max_x = screen_frame.origin.x + screen_frame.size.width - panel_frame.size.width - 8.0;
+                    let max_x = screen_frame.origin.x + screen_frame.size.width
+                        - panel_frame.size.width
+                        - 8.0;
                     let min_x = screen_frame.origin.x + 8.0;
                     if x > max_x {
                         x = max_x;
@@ -1006,9 +1100,16 @@ impl PopoverPanel {
                 } else {
                     let screen_frame = NSScreen::mainScreen(MainThreadMarker::from(&*h.panel))
                         .map(|s| s.visibleFrame())
-                        .unwrap_or(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0)));
-                    let x = screen_frame.origin.x + screen_frame.size.width - panel_frame.size.width - 24.0;
-                    let y = screen_frame.origin.y + screen_frame.size.height - panel_frame.size.height - 4.0;
+                        .unwrap_or(NSRect::new(
+                            NSPoint::new(0.0, 0.0),
+                            NSSize::new(1440.0, 900.0),
+                        ));
+                    let x = screen_frame.origin.x + screen_frame.size.width
+                        - panel_frame.size.width
+                        - 24.0;
+                    let y = screen_frame.origin.y + screen_frame.size.height
+                        - panel_frame.size.height
+                        - 4.0;
                     (x, y)
                 };
 
@@ -1039,31 +1140,31 @@ impl PopoverPanel {
         if GLOBAL_MONITOR_RUNNING.swap(true, Ordering::SeqCst) {
             return;
         }
-        std::thread::spawn(|| {
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(150));
-                let visible = HOLDER.with(|cell| {
-                    cell.borrow()
-                        .as_ref()
-                        .map(|h| h.panel.isVisible())
-                        .unwrap_or(false)
-                });
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let visible = HOLDER.with(|cell| {
+                cell.borrow()
+                    .as_ref()
+                    .map(|h| h.panel.isVisible())
+                    .unwrap_or(false)
+            });
 
-                if visible {
-                    let mouse = unsafe { NSEvent::mouseLocation() };
-                    let buttons = unsafe { NSEvent::pressedMouseButtons() };
-                    if buttons != 0 {
-                        HOLDER.with(|cell| {
-                            if let Some(h) = cell.borrow().as_ref() {
-                                let f = h.panel.frame();
-                                let in_x = mouse.x >= f.origin.x && mouse.x <= f.origin.x + f.size.width;
-                                let in_y = mouse.y >= f.origin.y && mouse.y <= f.origin.y + f.size.height;
-                                if !in_x || !in_y {
-                                    PopoverPanel::shared_hide();
-                                }
+            if visible {
+                let mouse = unsafe { NSEvent::mouseLocation() };
+                let buttons = unsafe { NSEvent::pressedMouseButtons() };
+                if buttons != 0 {
+                    HOLDER.with(|cell| {
+                        if let Some(h) = cell.borrow().as_ref() {
+                            let f = h.panel.frame();
+                            let in_x =
+                                mouse.x >= f.origin.x && mouse.x <= f.origin.x + f.size.width;
+                            let in_y =
+                                mouse.y >= f.origin.y && mouse.y <= f.origin.y + f.size.height;
+                            if !in_x || !in_y {
+                                PopoverPanel::shared_hide();
                             }
-                        });
-                    }
+                        }
+                    });
                 }
             }
         });
@@ -1162,12 +1263,8 @@ impl PopoverPanel {
         };
         let rgb = h.active_rgb.get();
 
-        let mut spec = crate::config::LedSpec::new(
-            "breathing",
-            rgb,
-            brightness,
-            Some(&rate_ms.to_string()),
-        );
+        let mut spec =
+            crate::config::LedSpec::new("breathing", rgb, brightness, Some(&rate_ms.to_string()));
 
         match effect_seg {
             0 => spec.turn_off(),
@@ -1197,7 +1294,8 @@ impl PopoverPanel {
                 let dpi = Self::slider_to_dpi(t);
                 h.active_dpi.set(dpi);
                 unsafe {
-                    h.dpi_value_label.setStringValue(&NSString::from_str(&format!("{dpi} DPI")));
+                    h.dpi_value_label
+                        .setStringValue(&NSString::from_str(&format!("{dpi} DPI")));
                     if let Some(idx) = Self::DPI_PRESETS.iter().position(|&p| p == dpi) {
                         h.dpi_presets.setSelectedSegment(idx as isize);
                     } else {
@@ -1214,7 +1312,8 @@ impl PopoverPanel {
             if let Some(h) = cell.borrow().as_ref() {
                 h.active_dpi.set(dpi);
                 unsafe {
-                    h.dpi_value_label.setStringValue(&NSString::from_str(&format!("{dpi} DPI")));
+                    h.dpi_value_label
+                        .setStringValue(&NSString::from_str(&format!("{dpi} DPI")));
                     h.dpi_slider.setDoubleValue(Self::dpi_to_slider(dpi));
                     if let Some(idx) = Self::DPI_PRESETS.iter().position(|&p| p == dpi) {
                         h.dpi_presets.setSelectedSegment(idx as isize);
@@ -1263,10 +1362,17 @@ impl PopoverPanel {
                 Self::update_color_ui(&h.color_buttons, &h.color_label, rgb, effect_seg);
 
                 let rate_raw = unsafe { h.rate_slider.doubleValue() } as u16;
-                let rate_ms = if rate_raw == 0 { 2000 } else { rate_raw.clamp(1000, 10000) };
+                let rate_ms = if rate_raw == 0 {
+                    2000
+                } else {
+                    rate_raw.clamp(1000, 10000)
+                };
                 unsafe {
                     h.rate_slider.setEnabled(effect_seg == 2 || effect_seg == 3);
-                    h.rate_label.setStringValue(&NSString::from_str(&Self::format_rate_label(rate_ms, effect_seg)));
+                    h.rate_label
+                        .setStringValue(&NSString::from_str(&Self::format_rate_label(
+                            rate_ms, effect_seg,
+                        )));
                 }
 
                 Self::collect_and_schedule(h);
@@ -1284,16 +1390,25 @@ impl PopoverPanel {
                     let mut effect_seg = unsafe { h.effect_control.selectedSegment() } as usize;
                     if effect_seg == 0 || effect_seg == 2 {
                         effect_seg = 3; // 切换到呼吸
-                        unsafe { h.effect_control.setSelectedSegment(3); }
+                        unsafe {
+                            h.effect_control.setSelectedSegment(3);
+                        }
                     }
 
                     Self::update_color_ui(&h.color_buttons, &h.color_label, rgb, effect_seg);
 
                     let rate_raw = unsafe { h.rate_slider.doubleValue() } as u16;
-                    let rate_ms = if rate_raw == 0 { 2000 } else { rate_raw.clamp(1000, 10000) };
+                    let rate_ms = if rate_raw == 0 {
+                        2000
+                    } else {
+                        rate_raw.clamp(1000, 10000)
+                    };
                     unsafe {
                         h.rate_slider.setEnabled(effect_seg == 2 || effect_seg == 3);
-                        h.rate_label.setStringValue(&NSString::from_str(&Self::format_rate_label(rate_ms, effect_seg)));
+                        h.rate_label
+                            .setStringValue(&NSString::from_str(&Self::format_rate_label(
+                                rate_ms, effect_seg,
+                            )));
                     }
 
                     Self::collect_and_schedule(h);
@@ -1306,7 +1421,8 @@ impl PopoverPanel {
         HOLDER.with(|cell| {
             if let Some(h) = cell.borrow().as_ref() {
                 unsafe {
-                    h.brightness_label.setStringValue(&NSString::from_str(&format!("{val}%")));
+                    h.brightness_label
+                        .setStringValue(&NSString::from_str(&format!("{val}%")));
                 }
 
                 Self::collect_and_schedule(h);
@@ -1321,7 +1437,10 @@ impl PopoverPanel {
                 let rate_ms = rounded.clamp(1000, 10000);
                 let effect_seg = unsafe { h.effect_control.selectedSegment() } as usize;
                 unsafe {
-                    h.rate_label.setStringValue(&NSString::from_str(&Self::format_rate_label(rate_ms, effect_seg)));
+                    h.rate_label
+                        .setStringValue(&NSString::from_str(&Self::format_rate_label(
+                            rate_ms, effect_seg,
+                        )));
                 }
 
                 Self::collect_and_schedule(h);
@@ -1333,12 +1452,14 @@ impl PopoverPanel {
         HOLDER.with(|cell| {
             if let Some(h) = cell.borrow().as_ref() {
                 unsafe {
-                    h.battery_label.setStringValue(&NSString::from_str(battery_text));
+                    h.battery_label
+                        .setStringValue(&NSString::from_str(battery_text));
                     h.mode_label.setStringValue(&NSString::from_str(mode_text));
                     if let Some(d) = dpi {
                         let clamped = d.clamp(100, 25600);
                         h.active_dpi.set(clamped);
-                        h.dpi_value_label.setStringValue(&NSString::from_str(&format!("{clamped} DPI")));
+                        h.dpi_value_label
+                            .setStringValue(&NSString::from_str(&format!("{clamped} DPI")));
                         h.dpi_slider.setDoubleValue(Self::dpi_to_slider(clamped));
                         if let Some(idx) = Self::DPI_PRESETS.iter().position(|&p| p == clamped) {
                             h.dpi_presets.setSelectedSegment(idx as isize);
@@ -1366,14 +1487,16 @@ impl PopoverPanel {
         HOLDER.with(|cell| {
             if let Some(h) = cell.borrow().as_ref() {
                 // 同步 DPI 状态
-                let live_dpi = controller::get_live_dpi().or_else(|| {
-                    crate::config::load().ok().and_then(|c| c.desired_dpi)
-                }).unwrap_or(1600);
+                let live_dpi = controller::get_live_dpi()
+                    .or_else(|| crate::config::load().ok().and_then(|c| c.desired_dpi))
+                    .unwrap_or(1600);
                 let clamped_dpi = live_dpi.clamp(100, 25600);
                 h.active_dpi.set(clamped_dpi);
                 unsafe {
-                    h.dpi_value_label.setStringValue(&NSString::from_str(&format!("{clamped_dpi} DPI")));
-                    h.dpi_slider.setDoubleValue(Self::dpi_to_slider(clamped_dpi));
+                    h.dpi_value_label
+                        .setStringValue(&NSString::from_str(&format!("{clamped_dpi} DPI")));
+                    h.dpi_slider
+                        .setDoubleValue(Self::dpi_to_slider(clamped_dpi));
                     if let Some(idx) = Self::DPI_PRESETS.iter().position(|&p| p == clamped_dpi) {
                         h.dpi_presets.setSelectedSegment(idx as isize);
                     } else {
@@ -1401,13 +1524,21 @@ impl PopoverPanel {
                     Self::update_color_ui(&h.color_buttons, &h.color_label, spec.rgb, effect_idx);
 
                     h.brightness_slider.setDoubleValue(spec.brightness as f64);
-                    h.brightness_label.setStringValue(&NSString::from_str(&format!("{}%", spec.brightness)));
+                    h.brightness_label
+                        .setStringValue(&NSString::from_str(&format!("{}%", spec.brightness)));
 
                     let raw_period = led::rate_period_ms(spec.rate.as_deref()).unwrap_or(2000);
-                    let period = if raw_period == 0 { 2000 } else { raw_period.clamp(1000, 10000) };
+                    let period = if raw_period == 0 {
+                        2000
+                    } else {
+                        raw_period.clamp(1000, 10000)
+                    };
                     h.rate_slider.setDoubleValue(period as f64);
                     h.rate_slider.setEnabled(effect_idx == 2 || effect_idx == 3);
-                    h.rate_label.setStringValue(&NSString::from_str(&Self::format_rate_label(period, effect_idx)));
+                    h.rate_label
+                        .setStringValue(&NSString::from_str(&Self::format_rate_label(
+                            period, effect_idx,
+                        )));
                 }
             }
         });
@@ -1415,43 +1546,93 @@ impl PopoverPanel {
     }
 
     pub fn sync_macro_ui() {
+        let clicked_key = HOLDER.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .and_then(|h| h.mouse_canvas.take_clicked_key())
+        });
+        if let Some(name) = clicked_key {
+            if let Some(gk) = crate::macro_engine::G_KEYS
+                .iter()
+                .find(|gk| gk.name == name)
+            {
+                Self::select_gkey(gk.id, true);
+            }
+        }
+
         HOLDER.with(|cell| {
             if let Some(h) = cell.borrow().as_ref() {
                 let running = crate::macro_engine::is_tap_running();
                 let phase = crate::macro_engine::recording_phase();
                 let is_recording = !matches!(phase, crate::macro_engine::RecordingPhase::Idle);
+                let mut bound_keys = HashSet::new();
 
                 unsafe {
                     if running {
-                        h.macro_toggle_btn.setTitle(&NSString::from_str("● 宏引擎已开启"));
+                        h.macro_toggle_btn
+                            .setTitle(&NSString::from_str("● 宏引擎已开启"));
                     } else {
-                        h.macro_toggle_btn.setTitle(&NSString::from_str("○ 宏引擎已停用"));
+                        h.macro_toggle_btn
+                            .setTitle(&NSString::from_str("○ 宏引擎已停用"));
                     }
 
                     for row in &h.gkey_rows {
                         let binding = crate::macro_engine::get_binding_for_key(row.key_id);
                         if let Some(b) = binding {
+                            if let Some(name) = Self::gkey_name_for_id(row.key_id) {
+                                bound_keys.insert(name.to_string());
+                            }
                             if let Some(text) = crate::macro_engine::get_binding_text(&b) {
+                                row.summary_label
+                                    .setStringValue(&NSString::from_str("文字 · 自动输入"));
+                                row.summary_label
+                                    .setTextColor(Some(&NSColor::systemBlueColor()));
+                                row.text_input.setEditable(true);
                                 row.text_input.setStringValue(&NSString::from_str(&text));
-                                row.text_input.setTextColor(Some(&NSColor::systemBlueColor()));
+                                row.text_input
+                                    .setPlaceholderString(Some(&NSString::from_str(
+                                        "输入自动打字文本...",
+                                    )));
+                                row.text_input.setTextColor(Some(&NSColor::labelColor()));
                             } else {
-                                row.text_input.setStringValue(&NSString::from_str(""));
                                 let summary = crate::macro_engine::format_binding_summary(&b);
-                                row.text_input.setPlaceholderString(Some(&NSString::from_str(&summary)));
+                                row.summary_label
+                                    .setStringValue(&NSString::from_str(&summary));
+                                row.summary_label
+                                    .setTextColor(Some(&NSColor::systemGreenColor()));
+                                row.text_input.setEditable(false);
+                                row.text_input.setStringValue(&NSString::from_str(""));
+                                row.text_input
+                                    .setPlaceholderString(Some(&NSString::from_str(
+                                        "非文字动作；清空后可输入文字",
+                                    )));
+                                row.text_input
+                                    .setTextColor(Some(&NSColor::secondaryLabelColor()));
                             }
                             row.clear_btn.setEnabled(true);
                         } else {
+                            row.summary_label
+                                .setStringValue(&NSString::from_str("未绑定"));
+                            row.summary_label
+                                .setTextColor(Some(&NSColor::secondaryLabelColor()));
+                            row.text_input.setEditable(true);
                             row.text_input.setStringValue(&NSString::from_str(""));
-                            row.text_input.setPlaceholderString(Some(&NSString::from_str("输入自动打字文本...")));
+                            row.text_input
+                                .setPlaceholderString(Some(&NSString::from_str(
+                                    "输入自动打字文本...",
+                                )));
+                            row.text_input.setTextColor(Some(&NSColor::labelColor()));
                             row.clear_btn.setEnabled(false);
                         }
                         row.record_btn.setEnabled(!is_recording);
                     }
+                    h.mouse_canvas.set_bound_keys(bound_keys);
 
                     h.macro_rec_seq_btn.setEnabled(!is_recording);
                     h.macro_rec_cancel_btn.setEnabled(is_recording);
 
-                    let is_sequence = matches!(phase, crate::macro_engine::RecordingPhase::Sequence { .. });
+                    let is_sequence =
+                        matches!(phase, crate::macro_engine::RecordingPhase::Sequence { .. });
                     h.macro_rec_finish_btn.setEnabled(is_sequence);
 
                     let (status_text, is_warn) = match &phase {
@@ -1462,12 +1643,12 @@ impl PopoverPanel {
                                 ("○ 宏引擎已停用 (点击开启以启用按键拦截)".to_string(), false)
                             }
                         }
-                        crate::macro_engine::RecordingPhase::AwaitMouse(crate::macro_engine::RecordingKind::Shortcut) => {
-                            ("👉 请按目标侧键 (G4..G11)...".to_string(), true)
-                        }
-                        crate::macro_engine::RecordingPhase::AwaitMouse(crate::macro_engine::RecordingKind::Sequence) => {
-                            ("👉 请按目标侧键开始录制序列...".to_string(), true)
-                        }
+                        crate::macro_engine::RecordingPhase::AwaitMouse(
+                            crate::macro_engine::RecordingKind::Shortcut,
+                        ) => ("👉 请按目标侧键 (G4..G11)...".to_string(), true),
+                        crate::macro_engine::RecordingPhase::AwaitMouse(
+                            crate::macro_engine::RecordingKind::Sequence,
+                        ) => ("👉 请按目标侧键开始录制序列...".to_string(), true),
                         crate::macro_engine::RecordingPhase::Shortcut { button } => {
                             let name = crate::macro_engine::get_gkey_by_button(*button)
                                 .map(|gk| format!("{}({})", gk.name, gk.desc))
@@ -1478,15 +1659,21 @@ impl PopoverPanel {
                             let name = crate::macro_engine::get_gkey_by_button(*button)
                                 .map(|gk| format!("{}({})", gk.name, gk.desc))
                                 .unwrap_or_else(|| format!("button{button}"));
-                            (format!("🔴 录制中 {name}: 已捕获 {events} 个按键事件"), true)
+                            (
+                                format!("🔴 录制中 {name}: 已捕获 {events} 个按键事件"),
+                                true,
+                            )
                         }
                     };
 
-                    h.macro_status_label.setStringValue(&NSString::from_str(&status_text));
+                    h.macro_status_label
+                        .setStringValue(&NSString::from_str(&status_text));
                     if is_warn {
-                        h.macro_status_label.setTextColor(Some(&NSColor::systemOrangeColor()));
+                        h.macro_status_label
+                            .setTextColor(Some(&NSColor::systemOrangeColor()));
                     } else {
-                        h.macro_status_label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                        h.macro_status_label
+                            .setTextColor(Some(&NSColor::secondaryLabelColor()));
                     }
                 }
             }

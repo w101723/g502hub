@@ -85,6 +85,14 @@ pub fn error_name(code: u8) -> &'static str {
     }
 }
 
+pub fn is_transient_error(error: &HidppError) -> bool {
+    match error {
+        HidppError::Timeout(_) | HidppError::Io(_) => true,
+        HidppError::Rejected { code, .. } => matches!(*code, 0x04 | 0x07 | 0x09 | 0x0B),
+        HidppError::Open(_) | HidppError::Invalid(_) => false,
+    }
+}
+
 /// 一个 HID++ vendor 接口的封装(线程安全)。
 pub struct Transport {
     dev: Mutex<HidDevice>,
@@ -209,9 +217,14 @@ impl Transport {
                 continue;
             }
             let (r_dev, r_feat, r_sub) = (data[1], data[2], data[3]);
-            // 错误报文:feature 位置 0xFF,byte3 回显 function|soft_id
-            if r_feat == ERR_FEATURE && r_dev == dev_index && (r_sub & 0x0F) == soft_id {
-                let code = data.get(4).copied().unwrap_or(0);
+            // HID++ 2.0 错误报文:
+            // [report, device, 0xFF, failed_feature, failed_function|soft_id, error_code]
+            if r_feat == ERR_FEATURE
+                && r_dev == dev_index
+                && r_sub == feature_index
+                && data.get(4).copied() == Some(expect)
+            {
+                let code = data.get(5).copied().unwrap_or(0);
                 return Err(HidppError::Rejected {
                     code,
                     message: error_name(code).to_string(),

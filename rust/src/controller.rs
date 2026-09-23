@@ -5,6 +5,7 @@
 use crate::config::{Config, DesiredMode};
 use crate::device::G502Device;
 use crate::features::dpi::Dpi;
+use crate::features::indicator_led::IndicatorLed;
 use crate::features::led::{self, Led};
 use crate::features::onboard::{get_onboard_mode, set_onboard_mode, OnboardMode};
 use crate::hidpp::HidppError;
@@ -36,7 +37,13 @@ pub fn read_mode(dev: &G502Device) -> Result<OnboardMode, HidppError> {
 }
 
 pub fn set_mode_confirmed(dev: &G502Device, mode: OnboardMode) -> Result<OnboardMode, HidppError> {
-    with_device_lock(|| set_onboard_mode(dev, mode))
+    with_device_lock(|| {
+        let actual = set_onboard_mode(dev, mode)?;
+        if actual == OnboardMode::Onboard {
+            IndicatorLed::new(dev)?.release()?;
+        }
+        Ok(actual)
+    })
 }
 
 pub fn set_dpi_confirmed(dev: &G502Device, dpi: u16) -> Result<u16, HidppError> {
@@ -68,6 +75,10 @@ fn apply_desired_state_inner(dev: &G502Device, cfg: &Config) -> Result<AppliedSt
         set_onboard_mode(dev, desired_mode)?
     };
 
+    if mode == OnboardMode::Onboard {
+        IndicatorLed::new(dev)?.release()?;
+    }
+
     let dpi = if mode == OnboardMode::Host {
         match target_dpi {
             Some(target) => {
@@ -88,11 +99,22 @@ fn apply_desired_state_inner(dev: &G502Device, cfg: &Config) -> Result<AppliedSt
     Ok(AppliedState { mode, dpi })
 }
 
-fn apply_led_spec_inner(
+pub(crate) fn apply_led_spec_inner(
+    dev: &G502Device,
     led: &Led<'_>,
     zone: u8,
     spec: &crate::config::LedSpec,
 ) -> Result<(), HidppError> {
+    if zone == led::ZONE_PRIMARY {
+        let indicator = IndicatorLed::new(dev)?;
+        if spec.off {
+            indicator.turn_off()?;
+        } else {
+            indicator.show_all()?;
+        }
+        std::thread::sleep(Duration::from_millis(12));
+    }
+
     if spec.off {
         led.set_off(zone)
     } else {
@@ -111,7 +133,7 @@ fn apply_desired_led_inner(dev: &G502Device, cfg: &Config) -> Result<(), HidppEr
         if wrote {
             std::thread::sleep(Duration::from_millis(25));
         }
-        apply_led_spec_inner(&led, zone, spec)?;
+        apply_led_spec_inner(dev, &led, zone, spec)?;
         wrote = true;
     }
     Ok(())
@@ -125,7 +147,7 @@ pub fn apply_led_spec(
 ) -> Result<(), HidppError> {
     with_device_lock(|| {
         let led = Led::new(dev)?;
-        apply_led_spec_inner(&led, zone, spec)
+        apply_led_spec_inner(dev, &led, zone, spec)
     })
 }
 
@@ -203,15 +225,18 @@ fn live_led_worker() {
 
             if let Ok(dev) = crate::device::get_conn(1) {
                 let _ = with_device_lock(|| {
+                    if read_mode(&dev)? != OnboardMode::Host {
+                        return Ok(());
+                    }
                     let led = Led::new(&dev)?;
                     match cmd.target {
                         TargetZone::Single(z) => {
-                            apply_led_spec_inner(&led, z, &cmd.spec)?;
+                            apply_led_spec_inner(&dev, &led, z, &cmd.spec)?;
                         }
                         TargetZone::All => {
-                            apply_led_spec_inner(&led, led::ZONE_PRIMARY, &cmd.spec)?;
+                            apply_led_spec_inner(&dev, &led, led::ZONE_PRIMARY, &cmd.spec)?;
                             std::thread::sleep(Duration::from_millis(25));
-                            apply_led_spec_inner(&led, led::ZONE_LOGO, &cmd.spec)?;
+                            apply_led_spec_inner(&dev, &led, led::ZONE_LOGO, &cmd.spec)?;
                         }
                     }
                     Ok(())
@@ -238,8 +263,10 @@ fn live_led_worker() {
                             .insert(led::zone_key(z).to_string(), to_save.spec);
                     }
                     TargetZone::All => {
-                        cfg.led_zones
-                            .insert(led::zone_key(led::ZONE_PRIMARY).to_string(), to_save.spec.clone());
+                        cfg.led_zones.insert(
+                            led::zone_key(led::ZONE_PRIMARY).to_string(),
+                            to_save.spec.clone(),
+                        );
                         cfg.led_zones
                             .insert(led::zone_key(led::ZONE_LOGO).to_string(), to_save.spec);
                     }

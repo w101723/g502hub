@@ -137,14 +137,20 @@ fn read_status(dev: &G502Device) -> Option<Result<BatteryInfo, HidppError>> {
 
 /// 读取电池状态,优先 0x1001(实测支持),失败逐级回退。
 pub fn read_battery(dev: &G502Device) -> Result<BatteryInfo, HidppError> {
+    let mut first_error = None;
     for reader in [read_voltage, read_unified, read_status] {
         if let Some(result) = reader(dev) {
-            if result.is_ok() {
-                return result;
+            match result {
+                Ok(info) => return Ok(info),
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
             }
         }
     }
-    Err(HidppError::Invalid(
-        "设备不支持任何已知电池 feature (0x1000/0x1001/0x1004)".into(),
-    ))
+    Err(first_error.unwrap_or_else(|| {
+        HidppError::Invalid("设备不支持任何已知电池 feature (0x1000/0x1001/0x1004)".into())
+    }))
 }

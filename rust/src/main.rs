@@ -5,6 +5,7 @@ mod features;
 mod hidpp;
 mod macro_engine;
 mod menubar;
+mod mouse_canvas;
 mod panel;
 mod probe;
 
@@ -14,7 +15,6 @@ use config::Config;
 use device::{ghub_agent_running, G502Device};
 use features::battery::read_battery;
 use features::dpi::Dpi;
-use features::led::Led;
 use std::time::Duration;
 
 /// G502 LIGHTSPEED 轻量管理工具(Rust 版)
@@ -74,7 +74,7 @@ enum Cmd {
     /// 侧键宏
     Macro {
         #[arg(default_value = "list")]
-        action: String, // list | test | run
+        action: String, // list | test | run | set-text | set-battery | clear
         name: Option<String>,
     },
     /// 低电量监控
@@ -343,13 +343,7 @@ fn cmd_profile(action: &str, name: Option<String>) -> Result<()> {
             .map(|v| Dpi::new(dev).and_then(|d| d.set_dpi(v)))
             .transpose()?;
         if let Some(led) = &p.led {
-            let l = Led::new(dev)?;
-            if led.off {
-                l.set_off(0)?;
-            } else {
-                let period = features::led::rate_period_ms(led.rate.as_deref())?;
-                l.set_effect(0, &led.effect, led.rgb, led.brightness, period)?;
-            }
+            controller::apply_led_spec(dev, features::led::ZONE_PRIMARY, led)?;
         }
         let mut saved = config::load()?;
         saved.desired_mode = config::DesiredMode::Host;
@@ -410,6 +404,31 @@ fn cmd_macro(action: &str, name: Option<String>) -> Result<()> {
         };
         macro_engine::save_text_binding(key_id, text)?;
         println!("已保存 {key_id} 文字宏: {text}");
+        return Ok(());
+    }
+    if action == "set-battery" {
+        let btn = name.as_deref().unwrap_or("mouse8");
+        let key_id = if let Some(gk) = macro_engine::get_gkey_by_id(btn) {
+            gk.id
+        } else {
+            btn
+        };
+        macro_engine::save_battery_binding(key_id)?;
+        println!("已保存 {key_id} 设备动作 · 电池电量");
+        return Ok(());
+    }
+    if action == "clear" {
+        let Some(btn_arg) = name else {
+            bail!("用法: g502hub macro clear <g4|mouse3|...>");
+        };
+        let btn = btn_arg.trim();
+        let key_id = if let Some(gk) = macro_engine::get_gkey_by_id(btn) {
+            gk.id
+        } else {
+            btn
+        };
+        macro_engine::clear_binding(key_id)?;
+        println!("已清除 {key_id} 绑定");
         return Ok(());
     }
     let Some(name) = name else {

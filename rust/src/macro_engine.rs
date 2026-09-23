@@ -3,7 +3,7 @@
 //! CGEvent buttonNumber: 0=左键 1=右键 2=中键 3=G4(后退) 4=G5(前进)…
 //! 需要辅助功能(Accessibility)权限。事件循环运行在独立线程的 CFRunLoop。
 
-use crate::config::{Action, MacroBinding};
+use crate::config::{Action, DeviceAction, MacroBinding};
 use anyhow::{anyhow, Result};
 use core_foundation::base::{CFRelease, TCFType};
 use core_foundation::boolean::CFBoolean;
@@ -412,9 +412,33 @@ pub fn play(actions: &[Action]) -> Result<()> {
     for action in actions {
         if let Some(ms) = action.delay_ms {
             std::thread::sleep(std::time::Duration::from_millis(ms));
+        } else if let Some(dev_action) = &action.device_action {
+            match dev_action {
+                DeviceAction::BatteryLevel => {
+                    if !crate::menubar::dispatch_menu_action("macro:battery-status") {
+                        let dev = crate::device::get_conn(2)?;
+                        let battery = crate::features::battery::read_battery(&dev)?;
+                        let cfg = crate::config::load()?;
+                        crate::features::battery_indicator::show_battery_level(
+                            &dev,
+                            battery.percent,
+                            &cfg,
+                        )?;
+                    }
+                }
+            }
         } else if let Some(keys) = &action.keys {
             if keys == "action:battery" {
-                crate::menubar::dispatch_menu_action("macro:battery-status");
+                if !crate::menubar::dispatch_menu_action("macro:battery-status") {
+                    let dev = crate::device::get_conn(2)?;
+                    let battery = crate::features::battery::read_battery(&dev)?;
+                    let cfg = crate::config::load()?;
+                    crate::features::battery_indicator::show_battery_level(
+                        &dev,
+                        battery.percent,
+                        &cfg,
+                    )?;
+                }
             } else {
                 tap_key(keys)?;
             }
@@ -534,14 +558,7 @@ static RECORDING_STATE: Mutex<RecordingState> = Mutex::new(RecordingState::Idle)
 static RECORDING_OUTCOME: Mutex<Option<RecordingOutcome>> = Mutex::new(None);
 
 fn empty_action() -> Action {
-    Action {
-        keys: None,
-        text: None,
-        keycode: None,
-        delay_ms: None,
-        key_down: None,
-        modifiers: Vec::new(),
-    }
+    Action::default()
 }
 
 /// 获取最近接收到的鼠标按键编号
@@ -629,18 +646,68 @@ pub struct GKeyDef {
 }
 
 pub const G_KEYS: &[GKeyDef] = &[
-    GKeyDef { id: "mouse3",  name: "G4",  desc: "侧键·后退", default_btn: 3, is_battery_default: false },
-    GKeyDef { id: "mouse4",  name: "G5",  desc: "侧键·前进", default_btn: 4, is_battery_default: false },
-    GKeyDef { id: "mouse5",  name: "G6",  desc: "侧键·瞄准(DPI Shift)", default_btn: 5, is_battery_default: false },
-    GKeyDef { id: "mouse6",  name: "G7",  desc: "左键旁·后(DPI -)", default_btn: 6, is_battery_default: false },
-    GKeyDef { id: "mouse7",  name: "G8",  desc: "左键旁·前(DPI +)", default_btn: 7, is_battery_default: false },
-    GKeyDef { id: "mouse8",  name: "G9",  desc: "滚轮后·电量/模式", default_btn: 8, is_battery_default: true },
-    GKeyDef { id: "mouse9",  name: "G10", desc: "滚轮·向左倾斜", default_btn: 9, is_battery_default: false },
-    GKeyDef { id: "mouse10", name: "G11", desc: "滚轮·向右倾斜", default_btn: 10, is_battery_default: false },
+    GKeyDef {
+        id: "mouse3",
+        name: "G4",
+        desc: "侧键·后退",
+        default_btn: 3,
+        is_battery_default: false,
+    },
+    GKeyDef {
+        id: "mouse4",
+        name: "G5",
+        desc: "侧键·前进",
+        default_btn: 4,
+        is_battery_default: false,
+    },
+    GKeyDef {
+        id: "mouse5",
+        name: "G6",
+        desc: "侧键·瞄准(DPI Shift)",
+        default_btn: 5,
+        is_battery_default: false,
+    },
+    GKeyDef {
+        id: "mouse6",
+        name: "G7",
+        desc: "左键旁·后(DPI -)",
+        default_btn: 6,
+        is_battery_default: false,
+    },
+    GKeyDef {
+        id: "mouse7",
+        name: "G8",
+        desc: "左键旁·前(DPI +)",
+        default_btn: 7,
+        is_battery_default: false,
+    },
+    GKeyDef {
+        id: "mouse8",
+        name: "G9",
+        desc: "滚轮后·电量/模式",
+        default_btn: 8,
+        is_battery_default: true,
+    },
+    GKeyDef {
+        id: "mouse9",
+        name: "G10",
+        desc: "滚轮·向左倾斜",
+        default_btn: 9,
+        is_battery_default: false,
+    },
+    GKeyDef {
+        id: "mouse10",
+        name: "G11",
+        desc: "滚轮·向右倾斜",
+        default_btn: 10,
+        is_battery_default: false,
+    },
 ];
 
 pub fn get_gkey_by_id(id: &str) -> Option<&'static GKeyDef> {
-    G_KEYS.iter().find(|k| k.id == id || k.name.eq_ignore_ascii_case(id))
+    G_KEYS
+        .iter()
+        .find(|k| k.id == id || k.name.eq_ignore_ascii_case(id))
 }
 
 pub fn get_gkey_by_button(button: u32) -> Option<&'static GKeyDef> {
@@ -649,33 +716,34 @@ pub fn get_gkey_by_button(button: u32) -> Option<&'static GKeyDef> {
 
 pub fn default_battery_binding() -> MacroBinding {
     MacroBinding {
-        name: Some("⚡️ 电池电量".into()),
+        name: Some("设备动作 · 电池电量".into()),
         enabled: true,
         actions: vec![Action {
-            keys: Some("action:battery".into()),
-            text: None,
-            keycode: None,
-            delay_ms: None,
-            key_down: None,
-            modifiers: Vec::new(),
+            device_action: Some(DeviceAction::BatteryLevel),
+            ..Action::default()
         }],
     }
 }
 
 pub fn get_binding_for_key(button_key: &str) -> Option<MacroBinding> {
+    let key_id = if let Some(gk) = get_gkey_by_id(button_key) {
+        gk.id
+    } else {
+        button_key
+    };
     if let Ok(cfg) = crate::config::load() {
-        if let Some(b) = cfg.macros.get(button_key) {
+        if let Some(b) = cfg.macros.get(key_id) {
             return Some(b.clone());
         }
-    }
-    if button_key == "mouse8" || button_key.eq_ignore_ascii_case("g9") {
-        return Some(default_battery_binding());
     }
     None
 }
 
 pub fn get_binding_text(binding: &MacroBinding) -> Option<String> {
     for a in &binding.actions {
+        if a.device_action.is_some() {
+            return None;
+        }
         if let Some(t) = &a.text {
             return Some(t.clone());
         }
@@ -692,12 +760,8 @@ pub fn save_text_binding(button_key: &str, text: &str) -> Result<()> {
         name: Some(format!("文字: \"{trimmed}\"")),
         enabled: true,
         actions: vec![Action {
-            keys: None,
             text: Some(trimmed.to_string()),
-            keycode: None,
-            delay_ms: None,
-            key_down: None,
-            modifiers: Vec::new(),
+            ..Action::default()
         }],
     };
     let macros = crate::config::update(|cfg| {
@@ -740,6 +804,9 @@ pub fn format_binding_summary(binding: &MacroBinding) -> String {
     }
     if let Some(name) = &binding.name {
         if !name.is_empty() {
+            if name == "⚡️ 电池电量" {
+                return "设备动作 · 电池电量".to_string();
+            }
             return name.clone();
         }
     }
@@ -750,9 +817,13 @@ pub fn format_binding_summary(binding: &MacroBinding) -> String {
         .actions
         .iter()
         .filter_map(|a| {
-            if let Some(k) = &a.keys {
+            if let Some(dev_act) = &a.device_action {
+                match dev_act {
+                    DeviceAction::BatteryLevel => Some("设备动作 · 电池电量".into()),
+                }
+            } else if let Some(k) = &a.keys {
                 if k == "action:battery" {
-                    Some("⚡️ 电池电量".into())
+                    Some("设备动作 · 电池电量".into())
                 } else {
                     Some(k.clone())
                 }
@@ -1427,16 +1498,7 @@ unsafe fn tap_callback_inner(
         Ok(b) => b,
         Err(_) => return event,
     };
-    let binding = bindings_guard
-        .get(key)
-        .cloned()
-        .or_else(|| {
-            if button == 8 {
-                Some(default_battery_binding())
-            } else {
-                None
-            }
-        });
+    let binding = bindings_guard.get(key).cloned();
     let Some(binding) = binding else {
         return event;
     };
@@ -1575,11 +1637,7 @@ mod tests {
                 enabled: true,
                 actions: vec![Action {
                     keys: Some("cmd+c".into()),
-                    text: None,
-                    keycode: None,
-                    delay_ms: None,
-                    key_down: None,
-                    modifiers: Vec::new(),
+                    ..Action::default()
                 }],
             },
         );
@@ -1639,8 +1697,12 @@ mod tests {
 
         let batt_binding = default_battery_binding();
         assert!(batt_binding.enabled);
-        assert_eq!(batt_binding.actions[0].keys.as_deref(), Some("action:battery"));
-        assert_eq!(format_binding_summary(&batt_binding), "⚡️ 电池电量");
+        assert_eq!(
+            batt_binding.actions[0].device_action,
+            Some(DeviceAction::BatteryLevel)
+        );
+        assert_eq!(batt_binding.actions[0].keys, None);
+        assert_eq!(format_binding_summary(&batt_binding), "设备动作 · 电池电量");
     }
 
     #[test]
@@ -1655,9 +1717,120 @@ mod tests {
                 delay_ms: None,
                 key_down: None,
                 modifiers: Vec::new(),
+                device_action: None,
             }],
         };
-        assert_eq!(get_binding_text(&text_binding), Some("hello world".to_string()));
-        assert_eq!(format_binding_summary(&text_binding), "文字: \"hello world\"");
+        assert_eq!(
+            get_binding_text(&text_binding),
+            Some("hello world".to_string())
+        );
+        assert_eq!(
+            format_binding_summary(&text_binding),
+            "文字: \"hello world\""
+        );
+    }
+
+    #[test]
+    fn test_battery_action_is_not_text() {
+        let batt_binding = default_battery_binding();
+        assert_eq!(get_binding_text(&batt_binding), None);
+
+        let custom_battery = MacroBinding {
+            name: None,
+            enabled: true,
+            actions: vec![Action {
+                device_action: Some(DeviceAction::BatteryLevel),
+                text: Some("should be ignored".into()),
+                ..Action::default()
+            }],
+        };
+        assert_eq!(get_binding_text(&custom_battery), None);
+    }
+
+    #[test]
+    fn test_battery_binding_formatting_summary() {
+        // Typed device action with explicit name
+        let b1 = default_battery_binding();
+        assert_eq!(format_binding_summary(&b1), "设备动作 · 电池电量");
+
+        // Typed device action without name
+        let b2 = MacroBinding {
+            name: None,
+            enabled: true,
+            actions: vec![Action {
+                device_action: Some(DeviceAction::BatteryLevel),
+                ..Action::default()
+            }],
+        };
+        assert_eq!(format_binding_summary(&b2), "设备动作 · 电池电量");
+
+        // Legacy key binding formatting
+        let b3 = MacroBinding {
+            name: None,
+            enabled: true,
+            actions: vec![Action {
+                keys: Some("action:battery".into()),
+                ..Action::default()
+            }],
+        };
+        assert_eq!(format_binding_summary(&b3), "设备动作 · 电池电量");
+
+        // Legacy name update in formatting
+        let b4 = MacroBinding {
+            name: Some("⚡️ 电池电量".into()),
+            enabled: true,
+            actions: vec![Action {
+                device_action: Some(DeviceAction::BatteryLevel),
+                ..Action::default()
+            }],
+        };
+        assert_eq!(format_binding_summary(&b4), "设备动作 · 电池电量");
+    }
+
+    #[test]
+    fn test_clear_and_reset_battery_binding() {
+        let temp_dir = std::env::temp_dir().join(format!("g502hub_test_{}", std::process::id()));
+        let orig_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_dir);
+
+        // 1. Initial default load: mouse8 has typed battery action
+        let cfg = crate::config::load().expect("load config");
+        assert!(cfg.macros.contains_key("mouse8"));
+
+        let b = get_binding_for_key("mouse8").expect("found mouse8 binding");
+        assert_eq!(b.actions[0].device_action, Some(DeviceAction::BatteryLevel));
+
+        // 2. Clear binding: mouse8 is removed and get_binding_for_key returns None (no synthetic fallback)
+        clear_binding("mouse8").expect("clear mouse8");
+        assert_eq!(get_binding_for_key("mouse8"), None);
+        assert_eq!(get_binding_for_key("g9"), None);
+
+        // 3. Reset binding via save_battery_binding: typed battery action restored
+        save_battery_binding("mouse8").expect("reset mouse8 battery");
+        let b_reset = get_binding_for_key("mouse8").expect("found mouse8 after reset");
+        assert_eq!(
+            b_reset.actions[0].device_action,
+            Some(DeviceAction::BatteryLevel)
+        );
+        assert_eq!(b_reset.actions[0].keys, None);
+        assert_eq!(format_binding_summary(&b_reset), "设备动作 · 电池电量");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        if let Some(h) = orig_home {
+            std::env::set_var("HOME", h);
+        }
+    }
+
+    #[test]
+    fn test_macro_tap_no_synthetic_g9_fallback() {
+        let bindings = BTreeMap::new();
+        // Mouse8 not in bindings: should not be synthesized
+        let tap = MacroTap::new(bindings);
+        {
+            let b = tap.bindings();
+            let guard = b.read().unwrap();
+            assert!(!guard.contains_key("mouse8"));
+        }
     }
 }
