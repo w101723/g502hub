@@ -1,18 +1,55 @@
-//! G502 鼠标按键布局矢量画布 (macOS AppKit 原生 NSBezierPath 绘制)
+//! G502 鼠标按键布局高精实机画布 (Logitech G HUB 原生电竞实机渲染)
 //!
-//! 绘制 G502 LIGHTSPEED 顶部视角与侧面视角的简化矢量轮廓与按键区域，
-//! 支持鼠标悬停、按键选中状态、已绑定宏状态显示，以及点击选中交互。
+//! 采用 G502 LIGHTSPEED / HERO 原生实机俯视与侧视高精渲染，
+//! 结合硬件级发光按键热点（Hotspots）、折线引出线（Leader Lines）与电竞药丸徽章（Badges），
+//! 支持鼠标悬停高亮、按键选中、已绑定宏状态提示以及精准命中测试。
 
 use objc2::mutability::MainThreadOnly;
 use objc2::rc::{Allocated, Retained};
 use objc2::{declare_class, msg_send, msg_send_id, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSBezierPath, NSColor, NSCursor, NSEvent, NSFont, NSFontAttributeName,
-    NSForegroundColorAttributeName, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSForegroundColorAttributeName, NSImage, NSTrackingArea, NSTrackingAreaOptions, NSView,
 };
-use objc2_foundation::{MainThreadMarker, NSMutableDictionary, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    MainThreadMarker, NSData, NSMutableDictionary, NSPoint, NSRect, NSSize, NSString,
+};
 use std::cell::RefCell;
 use std::collections::HashSet;
+
+const TOP_PNG: &[u8] = include_bytes!("../assets/g502_top.png");
+const SIDE_PNG: &[u8] = include_bytes!("../assets/g502_side.png");
+
+thread_local! {
+    static TOP_IMAGE: RefCell<Option<Retained<NSImage>>> = const { RefCell::new(None) };
+    static SIDE_IMAGE: RefCell<Option<Retained<NSImage>>> = const { RefCell::new(None) };
+}
+
+fn with_top_image<R>(f: impl FnOnce(&NSImage) -> R) -> R {
+    TOP_IMAGE.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        if opt.is_none() {
+            let mtm = MainThreadMarker::new().expect("must be on main thread");
+            let data = NSData::with_bytes(TOP_PNG);
+            let img = NSImage::initWithData(mtm.alloc(), &data).expect("load top png");
+            *opt = Some(img);
+        }
+        f(opt.as_ref().unwrap())
+    })
+}
+
+fn with_side_image<R>(f: impl FnOnce(&NSImage) -> R) -> R {
+    SIDE_IMAGE.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        if opt.is_none() {
+            let mtm = MainThreadMarker::new().expect("must be on main thread");
+            let data = NSData::with_bytes(SIDE_PNG);
+            let img = NSImage::initWithData(mtm.alloc(), &data).expect("load side png");
+            *opt = Some(img);
+        }
+        f(opt.as_ref().unwrap())
+    })
+}
 
 /// 视角模式: 俯视图(G7-G11) 或 侧视图(G4-G6)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,13 +64,20 @@ impl Default for CanvasMode {
     }
 }
 
-/// 归一化多边形 / 区域
+/// 按键区域与指示热点配置
 #[derive(Debug, Clone)]
 pub struct ZonePolygon {
     pub key: &'static str,
+    pub desc: &'static str,
     pub points: &'static [(f64, f64)],
+    pub hotspot: (f64, f64),
+    pub badge_left: bool,
+    pub badge_y_ratio: f64,
+    #[allow(dead_code)]
     pub label_pos: (f64, f64),
+    #[allow(dead_code)]
     pub leader_start: (f64, f64),
+    #[allow(dead_code)]
     pub leader_end: (f64, f64),
 }
 
@@ -57,12 +101,32 @@ pub fn point_in_polygon(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
     inside
 }
 
-/// 顶部视角按键热区 (俯视: 鼠标头部朝上 Y=1.0, 尾部朝下 Y=0.0, 左键在 X<0.5, 右键在 X>0.5)
+/// 计算等比居中的鼠标绘制视口 (保持 G502 真实硬件高精比例)
+pub fn calc_viewport(w: f64, h: f64, mode: CanvasMode) -> (f64, f64, f64, f64) {
+    let target_ratio = match mode {
+        CanvasMode::Top => 850.0 / 872.0,   // ~0.9748
+        CanvasMode::Side => 658.0 / 854.0,  // ~0.7705
+    };
+    let dh = (h * 0.90).min(h - 14.0);
+    let dw = dh * target_ratio;
+    let ox = match mode {
+        CanvasMode::Top => (w - dw) * 0.5,
+        CanvasMode::Side => (w * 0.53 - dw * 0.5).clamp(10.0, w - dw - 10.0),
+    };
+    let oy = (h - dh) * 0.5;
+    (dw, dh, ox, oy)
+}
+
+/// 顶部视角按键热区 (俯视)
 pub const TOP_KEY_ZONES: &[ZonePolygon] = &[
     // G8: 左键外缘前方 (DPI +)
     ZonePolygon {
         key: "G8",
+        desc: "DPI+",
         points: &[(0.24, 0.77), (0.35, 0.77), (0.35, 0.88), (0.24, 0.88)],
+        hotspot: (0.368, 0.693),
+        badge_left: true,
+        badge_y_ratio: 0.62,
         label_pos: (0.04, 0.86),
         leader_start: (0.24, 0.83),
         leader_end: (0.16, 0.86),
@@ -70,23 +134,35 @@ pub const TOP_KEY_ZONES: &[ZonePolygon] = &[
     // G7: 左键外缘后方 (DPI -)
     ZonePolygon {
         key: "G7",
+        desc: "DPI-",
         points: &[(0.24, 0.63), (0.35, 0.63), (0.35, 0.74), (0.24, 0.74)],
+        hotspot: (0.367, 0.618),
+        badge_left: true,
+        badge_y_ratio: 0.30,
         label_pos: (0.04, 0.67),
         leader_start: (0.24, 0.68),
         leader_end: (0.16, 0.67),
     },
-    // G10: 滚轮左摆
+    // G10: 滚轮向左摆动
     ZonePolygon {
         key: "G10",
+        desc: "滚轮左",
         points: &[(0.40, 0.72), (0.47, 0.72), (0.47, 0.87), (0.40, 0.87)],
+        hotspot: (0.502, 0.658),
+        badge_left: true,
+        badge_y_ratio: 0.88,
         label_pos: (0.12, 0.94),
         leader_start: (0.42, 0.82),
         leader_end: (0.24, 0.94),
     },
-    // G11: 滚轮右摆
+    // G11: 滚轮向右摆动
     ZonePolygon {
         key: "G11",
+        desc: "滚轮右",
         points: &[(0.53, 0.72), (0.60, 0.72), (0.60, 0.87), (0.53, 0.87)],
+        hotspot: (0.568, 0.658),
+        badge_left: false,
+        badge_y_ratio: 0.88,
         label_pos: (0.78, 0.94),
         leader_start: (0.58, 0.82),
         leader_end: (0.76, 0.94),
@@ -94,35 +170,51 @@ pub const TOP_KEY_ZONES: &[ZonePolygon] = &[
     // G9: 滚轮后方按键 (默认电量/配置切换)
     ZonePolygon {
         key: "G9",
+        desc: "⚡️电量",
         points: &[(0.44, 0.54), (0.56, 0.54), (0.56, 0.64), (0.44, 0.64)],
+        hotspot: (0.541, 0.481),
+        badge_left: false,
+        badge_y_ratio: 0.48,
         label_pos: (0.78, 0.60),
         leader_start: (0.56, 0.59),
         leader_end: (0.76, 0.60),
     },
 ];
 
-/// 侧面视角按键热区 (左侧视: 鼠标头部在右 X=1.0, 尾部在左 X=0.0, 底部在 Y=0.0)
+/// 侧面视角按键热区 (左侧视)
 pub const SIDE_KEY_ZONES: &[ZonePolygon] = &[
-    // G4: 侧键后退
-    ZonePolygon {
-        key: "G4",
-        points: &[(0.30, 0.54), (0.44, 0.54), (0.44, 0.67), (0.30, 0.67)],
-        label_pos: (0.14, 0.76),
-        leader_start: (0.36, 0.65),
-        leader_end: (0.24, 0.76),
-    },
     // G5: 侧键前进
     ZonePolygon {
         key: "G5",
+        desc: "前进",
         points: &[(0.45, 0.54), (0.59, 0.54), (0.59, 0.67), (0.45, 0.67)],
+        hotspot: (0.444, 0.528),
+        badge_left: true,
+        badge_y_ratio: 0.78,
         label_pos: (0.50, 0.88),
         leader_start: (0.52, 0.67),
         leader_end: (0.54, 0.86),
     },
+    // G4: 侧键后退
+    ZonePolygon {
+        key: "G4",
+        desc: "后退",
+        points: &[(0.30, 0.54), (0.44, 0.54), (0.44, 0.67), (0.30, 0.67)],
+        hotspot: (0.480, 0.394),
+        badge_left: true,
+        badge_y_ratio: 0.50,
+        label_pos: (0.14, 0.76),
+        leader_start: (0.36, 0.65),
+        leader_end: (0.24, 0.76),
+    },
     // G6: 瞄准键 / DPI Shift (最前端拇指键)
     ZonePolygon {
         key: "G6",
+        desc: "瞄准键",
         points: &[(0.57, 0.39), (0.70, 0.39), (0.70, 0.52), (0.57, 0.52)],
+        hotspot: (0.345, 0.577),
+        badge_left: true,
+        badge_y_ratio: 0.22,
         label_pos: (0.76, 0.66),
         leader_start: (0.66, 0.50),
         leader_end: (0.74, 0.66),
@@ -221,10 +313,8 @@ declare_class!(
             if w <= 0.0 || h <= 0.0 {
                 return;
             }
-            let nx = (local_pt.x / w).clamp(0.0, 1.0);
-            let ny = (local_pt.y / h).clamp(0.0, 1.0);
             let mode = *self.ivars().mode.borrow();
-            let hit = hit_test_key(mode, nx, ny).map(|s| s.to_string());
+            let hit = Self::resolve_hit(mode, w, h, local_pt).map(|s| s.to_string());
 
             let mut hovered = self.ivars().hovered_key.borrow_mut();
             if *hovered != hit {
@@ -262,10 +352,8 @@ declare_class!(
             if w <= 0.0 || h <= 0.0 {
                 return;
             }
-            let nx = (local_pt.x / w).clamp(0.0, 1.0);
-            let ny = (local_pt.y / h).clamp(0.0, 1.0);
             let mode = *self.ivars().mode.borrow();
-            if let Some(key) = hit_test_key(mode, nx, ny) {
+            if let Some(key) = Self::resolve_hit(mode, w, h, local_pt) {
                 let key_str = key.to_string();
                 *self.ivars().selected_key.borrow_mut() = Some(key_str.clone());
                 *self.ivars().clicked_key.borrow_mut() = Some(key_str);
@@ -292,23 +380,39 @@ declare_class!(
             let bound_set = self.ivars().bound_keys.borrow().clone();
 
             unsafe {
-                // 1. 底板微弱暗色背景
-                let bg_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.09, 0.10, 0.13, 0.85);
+                // 1. macOS 系统简约纯净浅灰底板 (#F7F7FA + 细边框 #E2E2E8)
+                let bg_color =
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.968, 0.968, 0.980, 1.0);
                 bg_color.setFill();
-                let bg_path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-                    bounds,
-                    8.0,
-                    8.0,
-                );
+                let bg_path =
+                    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bounds, 10.0, 10.0);
                 bg_path.fill();
 
-                // 2. 绘制对应视角的鼠标主体轮廓与关键结构
+                // 2. 简约精致边框线 (#E2E2E8)
+                let rim = NSColor::colorWithSRGBRed_green_blue_alpha(0.886, 0.886, 0.910, 1.0);
+                rim.setStroke();
+                bg_path.setLineWidth(1.0);
+                bg_path.stroke();
+
+                // 3. 计算等比居中视口 (避免在宽屏拉伸变形)
+                let (dw, dh, ox, oy) = calc_viewport(w, h, mode);
+
+                // 4. 绘制 G502 原生高精实机机身渲染图
+                let img_rect = NSRect::new(NSPoint::new(ox, oy), NSSize::new(dw, dh));
                 match mode {
-                    CanvasMode::Top => Self::draw_top_silhouette(w, h),
-                    CanvasMode::Side => Self::draw_side_silhouette(w, h),
+                    CanvasMode::Top => {
+                        with_top_image(|img| {
+                            img.drawInRect(img_rect);
+                        });
+                    }
+                    CanvasMode::Side => {
+                        with_side_image(|img| {
+                            img.drawInRect(img_rect);
+                        });
+                    }
                 }
 
-                // 3. 绘制热区按键与引出线/标签
+                // 5. 绘制按键热区指示光圈、折线引出线与高对比度药丸徽章
                 let zones = match mode {
                     CanvasMode::Top => TOP_KEY_ZONES,
                     CanvasMode::Side => SIDE_KEY_ZONES,
@@ -319,7 +423,7 @@ declare_class!(
                     let is_hov = hovered.as_deref() == Some(z.key);
                     let is_bnd = bound_set.contains(z.key);
 
-                    Self::draw_zone(w, h, z, is_sel, is_hov, is_bnd);
+                    Self::draw_zone(w, dw, dh, ox, oy, z, is_sel, is_hov, is_bnd);
                 }
             }
         }
@@ -367,6 +471,64 @@ impl G502MouseCanvas {
         self.ivars().clicked_key.borrow_mut().take()
     }
 
+    /// 计算指定按键在画布中的药丸徽章外接矩形
+    pub fn badge_rect_for_zone(w: f64, dw: f64, dh: f64, ox: f64, oy: f64, z: &ZonePolygon) -> NSRect {
+        let badge_w = 90.0;
+        let badge_h = 22.0;
+        let bx = if z.badge_left {
+            (ox - badge_w - 38.0).max(16.0)
+        } else {
+            (ox + dw + 38.0).min(w - badge_w - 16.0)
+        };
+        let by = oy + z.badge_y_ratio * dh - badge_h * 0.5;
+        NSRect::new(NSPoint::new(bx, by), NSSize::new(badge_w, badge_h))
+    }
+
+    /// 在画布中定位按键热点或标签徽章的命中测试
+    pub fn resolve_hit(
+        mode: CanvasMode,
+        w: f64,
+        h: f64,
+        local_pt: NSPoint,
+    ) -> Option<&'static str> {
+        let (dw, dh, ox, oy) = calc_viewport(w, h, mode);
+        let zones = match mode {
+            CanvasMode::Top => TOP_KEY_ZONES,
+            CanvasMode::Side => SIDE_KEY_ZONES,
+        };
+
+        // 1. 优先检查引出端药丸徽章 (Badge Rect)
+        for z in zones {
+            let rect = Self::badge_rect_for_zone(w, dw, dh, ox, oy, z);
+            if local_pt.x >= rect.origin.x
+                && local_pt.x <= rect.origin.x + rect.size.width
+                && local_pt.y >= rect.origin.y
+                && local_pt.y <= rect.origin.y + rect.size.height
+            {
+                return Some(z.key);
+            }
+        }
+
+        // 2. 检查鼠标机身上的精确发光圆点热区 (半径 16pt)
+        for z in zones {
+            let hx = ox + z.hotspot.0 * dw;
+            let hy = oy + z.hotspot.1 * dh;
+            let dist_sq = (local_pt.x - hx) * (local_pt.x - hx) + (local_pt.y - hy) * (local_pt.y - hy);
+            if dist_sq <= 16.0 * 16.0 {
+                return Some(z.key);
+            }
+        }
+
+        // 3. 检查兼容性多边形区域 (Ray casting)
+        let nx = ((local_pt.x - ox) / dw).clamp(0.0, 1.0);
+        let ny = ((local_pt.y - oy) / dh).clamp(0.0, 1.0);
+        if let Some(k) = hit_test_key(mode, nx, ny) {
+            return Some(k);
+        }
+
+        None
+    }
+
     // ------------------------------------------------------------------ //
     // 私有绘制辅助函数
     // ------------------------------------------------------------------ //
@@ -381,251 +543,130 @@ impl G502MouseCanvas {
         let _: () = msg_send![&s, drawInRect: rect withAttributes: &*dict];
     }
 
-    /// 绘制 G502 经典俯视多边形机身轮廓 (带左侧指托、分体左右主按键、滚轮槽)
-    unsafe fn draw_top_silhouette(w: f64, h: f64) {
-        // 主外壳轮廓
-        let body_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.16, 0.18, 0.22, 1.0);
-        let border_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.28, 0.32, 0.40, 0.9);
-
-        let path = NSBezierPath::bezierPath();
-        let body_pts: &[(f64, f64)] = &[
-            (0.50, 0.12), // 尾部中心底
-            (0.38, 0.15), // 尾部左下
-            (0.28, 0.24), // 掌托左下
-            (0.22, 0.38), // 左指托扩展尖端
-            (0.23, 0.50), // 左指托前过渡
-            (0.28, 0.60), // 腰部左内收
-            (0.27, 0.75), // 左前边缘
-            (0.34, 0.92), // 左前按键尖端
-            (0.48, 0.88), // 主按键分界左凹槽
-            (0.52, 0.88), // 主按键分界右凹槽
-            (0.66, 0.91), // 右前按键尖端
-            (0.72, 0.72), // 右前侧边缘
-            (0.73, 0.45), // 右腰防滑区
-            (0.68, 0.26), // 掌托右侧
-            (0.60, 0.15), // 尾部右下
-        ];
-
-        let pt0 = body_pts[0];
-        path.moveToPoint(NSPoint::new(pt0.0 * w, pt0.1 * h));
-        for pt in &body_pts[1..] {
-            path.lineToPoint(NSPoint::new(pt.0 * w, pt.1 * h));
-        }
-        path.closePath();
-
-        body_color.setFill();
-        path.fill();
-        border_color.setStroke();
-        path.setLineWidth(1.2);
-        path.stroke();
-
-        // 掌托与指托装饰棱线 (G502 标志性机甲倒角切面)
-        let wing_line = NSBezierPath::bezierPath();
-        wing_line.moveToPoint(NSPoint::new(0.22 * w, 0.38 * h));
-        wing_line.lineToPoint(NSPoint::new(0.34 * w, 0.42 * h));
-        wing_line.lineToPoint(NSPoint::new(0.40 * w, 0.30 * h));
-        let accent_line_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.22, 0.25, 0.30, 0.8);
-        accent_line_color.setStroke();
-        wing_line.setLineWidth(1.0);
-        wing_line.stroke();
-
-        // 中间滚轮槽及金属滚轮
-        let wheel_well_rect = NSRect::new(
-            NSPoint::new(0.46 * w, 0.68 * h),
-            NSSize::new(0.08 * w, 0.22 * h),
-        );
-        let well_path =
-            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(wheel_well_rect, 2.0, 2.0);
-        let well_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.10, 0.11, 0.14, 1.0);
-        well_color.setFill();
-        well_path.fill();
-
-        // 滚轮本体
-        let wheel_rect = NSRect::new(
-            NSPoint::new(0.475 * w, 0.72 * h),
-            NSSize::new(0.05 * w, 0.15 * h),
-        );
-        let wheel_path =
-            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(wheel_rect, 2.0, 2.0);
-        let wheel_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.35, 0.38, 0.44, 1.0);
-        wheel_color.setFill();
-        wheel_path.fill();
-
-        // 左右主按键中缝分界线
-        let split_line = NSBezierPath::bezierPath();
-        split_line.moveToPoint(NSPoint::new(0.50 * w, 0.90 * h));
-        split_line.lineToPoint(NSPoint::new(0.50 * w, 0.92 * h));
-        let seam_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.10, 0.11, 0.14, 1.0);
-        seam_color.setStroke();
-        split_line.setLineWidth(1.5);
-        split_line.stroke();
-
-        // G 徽标指示 (发光区示意)
-        let logo_center = NSPoint::new(0.50 * w, 0.28 * h);
-        let logo_rect = NSRect::new(
-            NSPoint::new(logo_center.x - 6.0, logo_center.y - 6.0),
-            NSSize::new(12.0, 12.0),
-        );
-        let logo_path = NSBezierPath::bezierPathWithOvalInRect(logo_rect);
-        let logo_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.18, 0.45, 0.70, 0.7);
-        logo_color.setFill();
-        logo_path.fill();
-    }
-
-    /// 绘制 G502 经典侧视流线轮廓 (带前俯冲、大拇指托、顶部滚轮突起)
-    unsafe fn draw_side_silhouette(w: f64, h: f64) {
-        let body_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.16, 0.18, 0.22, 1.0);
-        let border_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.28, 0.32, 0.40, 0.9);
-
-        let path = NSBezierPath::bezierPath();
-        let side_pts: &[(f64, f64)] = &[
-            (0.18, 0.26), // 尾部着地处
-            (0.22, 0.45), // 掌托后背弧顶起
-            (0.35, 0.68), // 掌托高点
-            (0.50, 0.73), // 隆起最高峰 (滚轮后)
-            (0.66, 0.65), // 主按键向下倾斜
-            (0.84, 0.48), // 前端尖部俯冲
-            (0.85, 0.38), // 前底唇
-            (0.72, 0.36), // 拇指前方托槽底部
-            (0.42, 0.34), // 拇指托底侧展裙边
-            (0.25, 0.28), // 尾部底部
-        ];
-
-        let pt0 = side_pts[0];
-        path.moveToPoint(NSPoint::new(pt0.0 * w, pt0.1 * h));
-        for pt in &side_pts[1..] {
-            path.lineToPoint(NSPoint::new(pt.0 * w, pt.1 * h));
-        }
-        path.closePath();
-
-        body_color.setFill();
-        path.fill();
-        border_color.setStroke();
-        path.setLineWidth(1.2);
-        path.stroke();
-
-        // 侧面拇指防滑纹理三角形示意
-        let grip_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.12, 0.13, 0.16, 0.9);
-        let grip_pts: &[(f64, f64)] = &[(0.30, 0.38), (0.54, 0.38), (0.48, 0.50), (0.34, 0.50)];
-        let grip_path = NSBezierPath::bezierPath();
-        grip_path.moveToPoint(NSPoint::new(grip_pts[0].0 * w, grip_pts[0].1 * h));
-        for pt in &grip_pts[1..] {
-            grip_path.lineToPoint(NSPoint::new(pt.0 * w, pt.1 * h));
-        }
-        grip_path.closePath();
-        grip_color.setFill();
-        grip_path.fill();
-
-        // 滚轮顶部露出剪影
-        let wheel_rect = NSRect::new(
-            NSPoint::new(0.68 * w, 0.68 * h),
-            NSSize::new(0.06 * w, 0.10 * h),
-        );
-        let wheel_path =
-            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(wheel_rect, 3.0, 3.0);
-        let wheel_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.35, 0.38, 0.44, 1.0);
-        wheel_color.setFill();
-        wheel_path.fill();
-    }
-
-    /// 绘制单个按键热区、引出线与 G 编号标签
+    /// 绘制按键热区、发光光圈、引出折线与高对比度药丸徽章
     unsafe fn draw_zone(
         w: f64,
-        h: f64,
+        dw: f64,
+        dh: f64,
+        ox: f64,
+        oy: f64,
         zone: &ZonePolygon,
         is_selected: bool,
         is_hovered: bool,
         is_bound: bool,
     ) {
-        // 1. 颜色状态决议
-        // 默认未绑定: 半透明青灰; 已绑定: 柔和绿; 悬停: 亮天蓝; 选中: 活力青/蓝
-        let (fill_c, stroke_c, tag_bg_c, tag_fg_c) = if is_selected {
+        // 1. 色彩管线 (macOS 系统简约明亮风格规范)
+        let (stroke_c, tag_bg_c, tag_fg_c) = if is_selected {
             (
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.55, 0.95, 0.85),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.4, 0.85, 1.0, 1.0),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.55, 0.95, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.443, 0.890, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.443, 0.890, 1.0),
                 NSColor::whiteColor(),
             )
         } else if is_hovered {
             (
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.15, 0.45, 0.75, 0.75),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.30, 0.75, 1.0, 0.95),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.20, 0.55, 0.85, 1.0),
-                NSColor::whiteColor(),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.443, 0.890, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.92, 0.96, 1.0, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.443, 0.890, 1.0),
             )
         } else if is_bound {
             (
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.12, 0.42, 0.30, 0.70),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.25, 0.80, 0.55, 0.90),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.14, 0.48, 0.34, 1.0),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.85, 1.0, 0.90, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.204, 0.780, 0.349, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.93, 0.98, 0.94, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.106, 0.400, 0.150, 1.0),
             )
         } else {
             (
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.20, 0.24, 0.30, 0.60),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.38, 0.44, 0.55, 0.80),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.22, 0.26, 0.32, 0.95),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.75, 0.80, 0.88, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.78, 0.80, 0.84, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.114, 0.114, 0.122, 1.0),
             )
         };
 
-        // 2. 绘制多边形热区按键块
-        let path = NSBezierPath::bezierPath();
-        let pt0 = zone.points[0];
-        path.moveToPoint(NSPoint::new(pt0.0 * w, pt0.1 * h));
-        for pt in &zone.points[1..] {
-            path.lineToPoint(NSPoint::new(pt.0 * w, pt.1 * h));
-        }
-        path.closePath();
+        // 2. 按键机身热点坐标 (基于高精实机照片按键中心)
+        let hx = ox + zone.hotspot.0 * dw;
+        let hy = oy + zone.hotspot.1 * dh;
 
-        fill_c.setFill();
-        path.fill();
-        stroke_c.setStroke();
-        path.setLineWidth(if is_selected || is_hovered { 1.6 } else { 1.0 });
-        path.stroke();
+        // 3. 药丸胶囊徽章定位
+        let badge_rect = Self::badge_rect_for_zone(w, dw, dh, ox, oy, zone);
+        let badge_w = badge_rect.size.width;
+        let badge_h = badge_rect.size.height;
+        let bx = badge_rect.origin.x;
+        let by = badge_rect.origin.y;
 
-        // 3. 常显折线引出线 (Leader Line)
+        // 引出线锚点 (徽章贴近机身一侧的垂直中心)
+        let (target_x, target_y) = if zone.badge_left {
+            (bx + badge_w, by + badge_h * 0.5)
+        } else {
+            (bx, by + badge_h * 0.5)
+        };
+
+        // 4. 绘制折角引出线 (Leader Line)
         let leader = NSBezierPath::bezierPath();
-        let s_x = zone.leader_start.0 * w;
-        let s_y = zone.leader_start.1 * h;
-        let e_x = zone.leader_end.0 * w;
-        let e_y = zone.leader_end.1 * h;
-
-        leader.moveToPoint(NSPoint::new(s_x, s_y));
-        // 水平/垂直两段折线，产生工整指引效果
-        let mid_x = (s_x + e_x) * 0.5;
-        leader.lineToPoint(NSPoint::new(mid_x, e_y));
-        leader.lineToPoint(NSPoint::new(e_x, e_y));
+        leader.moveToPoint(NSPoint::new(hx, hy));
+        let mid_x = (hx + target_x) * 0.5;
+        leader.lineToPoint(NSPoint::new(mid_x, target_y));
+        leader.lineToPoint(NSPoint::new(target_x, target_y));
 
         stroke_c.setStroke();
-        leader.setLineWidth(1.1);
+        leader.setLineWidth(if is_selected || is_hovered { 1.5 } else { 1.0 });
         leader.stroke();
 
-        // 4. 引出端常显标签徽章 (Badge Pill / Rect)
-        let badge_w = 34.0;
-        let badge_h = 17.0;
-        let badge_x = zone.label_pos.0 * w;
-        let badge_y = zone.label_pos.1 * h - badge_h * 0.5;
-        let badge_rect = NSRect::new(
-            NSPoint::new(badge_x, badge_y),
-            NSSize::new(badge_w, badge_h),
-        );
+        // 5. 绘制机身发光圆圈热区 (Hotspot Indicator)
+        if is_selected || is_hovered {
+            let glow_r = 7.5;
+            let glow_rect = NSRect::new(
+                NSPoint::new(hx - glow_r, hy - glow_r),
+                NSSize::new(glow_r * 2.0, glow_r * 2.0),
+            );
+            let glow_path = NSBezierPath::bezierPathWithOvalInRect(glow_rect);
+            let glow_c = if is_selected {
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.443, 0.890, 0.30)
+            } else {
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.443, 0.890, 0.18)
+            };
+            glow_c.setFill();
+            glow_path.fill();
+        }
 
+        // 外层热点光圈环
+        let ring_r = 4.0;
+        let ring_rect = NSRect::new(
+            NSPoint::new(hx - ring_r, hy - ring_r),
+            NSSize::new(ring_r * 2.0, ring_r * 2.0),
+        );
+        let ring_path = NSBezierPath::bezierPathWithOvalInRect(ring_rect);
+        stroke_c.setStroke();
+        ring_path.setLineWidth(1.2);
+        ring_path.stroke();
+
+        // 核心发光微珠
+        let dot_r = if is_selected { 2.2 } else { 1.5 };
+        let dot_rect = NSRect::new(
+            NSPoint::new(hx - dot_r, hy - dot_r),
+            NSSize::new(dot_r * 2.0, dot_r * 2.0),
+        );
+        let dot_path = NSBezierPath::bezierPathWithOvalInRect(dot_rect);
+        stroke_c.setFill();
+        dot_path.fill();
+
+        // 6. 绘制引出端电竞药丸徽章 (Capsule Badge)
         let badge_path =
-            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(badge_rect, 4.0, 4.0);
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(badge_rect, 6.0, 6.0);
         tag_bg_c.setFill();
         badge_path.fill();
+
         stroke_c.setStroke();
-        badge_path.setLineWidth(1.0);
+        badge_path.setLineWidth(if is_selected { 1.5 } else { 1.0 });
         badge_path.stroke();
 
-        // 5. 徽章内部居中文本 "G4"..."G11"
+        // 7. 徽章内部高对比度文字
         let font = NSFont::boldSystemFontOfSize(10.5);
+        let label_text = format!("{} · {}", zone.key, zone.desc);
         let text_rect = NSRect::new(
-            NSPoint::new(badge_x + 4.0, badge_y + 1.5),
-            NSSize::new(badge_w - 4.0, badge_h),
+            NSPoint::new(bx + 5.0, by + 3.0),
+            NSSize::new(badge_w - 10.0, badge_h - 4.0),
         );
-        Self::draw_text(zone.key, text_rect, &font, &tag_fg_c);
+        Self::draw_text(&label_text, text_rect, &font, &tag_fg_c);
     }
 }
 
@@ -724,7 +765,7 @@ mod tests {
         // G6
         assert_eq!(hit_test_key(CanvasMode::Side, 0.64, 0.45), Some("G6"));
 
-        // 空白背景区域不应命中任何键
+        // 空平背景区域不应命中任何键
         assert_eq!(hit_test_key(CanvasMode::Side, 0.05, 0.05), None);
         assert_eq!(hit_test_key(CanvasMode::Side, 0.95, 0.95), None);
     }

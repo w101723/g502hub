@@ -293,23 +293,19 @@ impl App {
             }
         }
 
-        // 同步状态到 PopoverPanel
+        // 同步状态到 PopoverPanel (紧凑优雅展示，防止超出头部约束)
         let battery_str = snap
             .battery
             .as_ref()
             .map(|b| {
                 let icon = if b.charging { "⚡️" } else { "🔋" };
-                let volt = b
-                    .voltage_mv
-                    .map(|v| format!(" · {v}mV"))
-                    .unwrap_or_default();
-                format!("{icon} {}% {}{volt}", b.percent, b.state_text)
+                format!("{icon} {}%", b.percent)
             })
             .unwrap_or_else(|| "🔋 未连接".into());
         let mode_str = match snap.mode {
-            Some(OnboardMode::Onboard) => "控制模式: 板载控制 (固件自管)",
-            Some(OnboardMode::Host) => "控制模式: 主机控制 (自动恢复)",
-            None => "控制模式: 未知",
+            Some(OnboardMode::Onboard) => "板载控制",
+            Some(OnboardMode::Host) => "主机控制",
+            None => "未知",
         };
         crate::panel::PopoverPanel::sync_status(&battery_str, mode_str, snap.dpi);
 

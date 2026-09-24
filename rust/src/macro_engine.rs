@@ -380,31 +380,81 @@ fn tap_key(spec: &str) -> Result<()> {
     Ok(())
 }
 
-fn type_text(text: &str) -> Result<()> {
+fn type_text_cgevent(text: &str) -> Result<()> {
     let utf16: Vec<u16> = text.encode_utf16().collect();
     if utf16.is_empty() {
         return Ok(());
     }
-    unsafe {
-        let down = CGEventCreateKeyboardEvent(std::ptr::null_mut(), 0, true);
-        if down.is_null() {
-            return Err(anyhow!("CGEventCreateKeyboardEvent down 失败"));
-        }
-        CGEventKeyboardSetUnicodeString(down, utf16.len(), utf16.as_ptr());
-        CGEventSetIntegerValueField(down, K_CG_EVENT_SOURCE_USER_DATA, PLAYBACK_EVENT_TAG);
-        CGEventPost(K_CG_SESSION_EVENT_TAP, down);
-        CFRelease(down);
+    for chunk in utf16.chunks(20) {
+        unsafe {
+            let down = CGEventCreateKeyboardEvent(std::ptr::null_mut(), 0, true);
+            if down.is_null() {
+                return Err(anyhow!("CGEventCreateKeyboardEvent down 失败"));
+            }
+            CGEventKeyboardSetUnicodeString(down, chunk.len(), chunk.as_ptr());
+            CGEventSetIntegerValueField(down, K_CG_EVENT_SOURCE_USER_DATA, PLAYBACK_EVENT_TAG);
+            CGEventPost(K_CG_SESSION_EVENT_TAP, down);
+            CFRelease(down);
 
-        let up = CGEventCreateKeyboardEvent(std::ptr::null_mut(), 0, false);
-        if up.is_null() {
-            return Err(anyhow!("CGEventCreateKeyboardEvent up 失败"));
+            let up = CGEventCreateKeyboardEvent(std::ptr::null_mut(), 0, false);
+            if up.is_null() {
+                return Err(anyhow!("CGEventCreateKeyboardEvent up 失败"));
+            }
+            CGEventKeyboardSetUnicodeString(up, chunk.len(), chunk.as_ptr());
+            CGEventSetIntegerValueField(up, K_CG_EVENT_SOURCE_USER_DATA, PLAYBACK_EVENT_TAG);
+            CGEventPost(K_CG_SESSION_EVENT_TAP, up);
+            CFRelease(up);
         }
-        CGEventKeyboardSetUnicodeString(up, utf16.len(), utf16.as_ptr());
-        CGEventSetIntegerValueField(up, K_CG_EVENT_SOURCE_USER_DATA, PLAYBACK_EVENT_TAG);
-        CGEventPost(K_CG_SESSION_EVENT_TAP, up);
-        CFRelease(up);
+        std::thread::sleep(std::time::Duration::from_millis(15));
     }
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    Ok(())
+}
+
+fn type_text(text: &str) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    // 短暂等待物理鼠标按键抬起（50ms），防止系统处于鼠标拖拽状态时抑制键盘事件
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // 首选方案：使用系统剪贴板注入 + Cmd+V 快速粘贴
+    // 自动暂存并在 250ms 后恢复用户原剪贴板内容，彻底兼容中英文字符、符号、任何长度及第三方中文输入法
+    let paste_result = (|| -> Result<()> {
+        let pb = unsafe { objc2_app_kit::NSPasteboard::generalPasteboard() };
+        let prev_text = unsafe {
+            pb.stringForType(objc2_app_kit::NSPasteboardTypeString)
+                .map(|s| s.to_string())
+        };
+        unsafe {
+            pb.clearContents();
+            pb.setString_forType(
+                &objc2_foundation::NSString::from_str(text),
+                objc2_app_kit::NSPasteboardTypeString,
+            );
+        }
+
+        tap_key("cmd+v")?;
+
+        if let Some(old) = prev_text {
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let pb = unsafe { objc2_app_kit::NSPasteboard::generalPasteboard() };
+                unsafe {
+                    pb.clearContents();
+                    pb.setString_forType(
+                        &objc2_foundation::NSString::from_str(&old),
+                        objc2_app_kit::NSPasteboardTypeString,
+                    );
+                }
+            });
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = paste_result {
+        mlog(&format!("剪贴板注入粘贴失败，降级为 CGEvent: {e}"));
+        type_text_cgevent(text)?;
+    }
     Ok(())
 }
 

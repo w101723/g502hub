@@ -104,10 +104,11 @@ pub fn show_battery_level(dev: &G502Device, percent: u8, cfg: &Config) -> Result
     controller::with_device_lock(|| {
         if controller::read_mode(dev)? == OnboardMode::Host {
             let led = Led::new(dev)?;
-            controller::apply_led_spec_inner(dev, &led, led::ZONE_PRIMARY, &restore)
-        } else {
-            IndicatorLed::new(dev)?.release()
+            controller::apply_led_spec_inner(dev, &led, led::ZONE_PRIMARY, &restore)?;
+        } else if let Ok(indicator) = IndicatorLed::new(dev) {
+            let _ = indicator.release();
         }
+        Ok(())
     })
 }
 

@@ -76,7 +76,9 @@ fn apply_desired_state_inner(dev: &G502Device, cfg: &Config) -> Result<AppliedSt
     };
 
     if mode == OnboardMode::Onboard {
-        IndicatorLed::new(dev)?.release()?;
+        if let Ok(indicator) = IndicatorLed::new(dev) {
+            let _ = indicator.release();
+        }
     }
 
     let dpi = if mode == OnboardMode::Host {
@@ -106,13 +108,14 @@ pub(crate) fn apply_led_spec_inner(
     spec: &crate::config::LedSpec,
 ) -> Result<(), HidppError> {
     if zone == led::ZONE_PRIMARY {
-        let indicator = IndicatorLed::new(dev)?;
-        if spec.off {
-            indicator.turn_off()?;
-        } else {
-            indicator.show_all()?;
+        if let Ok(indicator) = IndicatorLed::new(dev) {
+            if spec.off {
+                let _ = indicator.turn_off();
+            } else {
+                let _ = indicator.show_all();
+            }
+            std::thread::sleep(Duration::from_millis(12));
         }
-        std::thread::sleep(Duration::from_millis(12));
     }
 
     if spec.off {

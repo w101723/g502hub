@@ -75,7 +75,7 @@ impl<'a> IndicatorLed<'a> {
         }
     }
 
-    /// 点亮全部 3 格指示灯（主要灯带默认效果）。
+    /// 点亮全部 3 格指示灯（主要灯带效果）。
     pub fn show_all(&self) -> Result<(), HidppError> {
         self.show_bars(PRIMARY_SEGMENT_COUNT)
     }
@@ -155,6 +155,14 @@ mod tests {
             state_params(BATTERY_LED_INDEX, MODE_OFF, 0, 0, 0),
             [0, 0, 1, 0, 0, 0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn live_show_all_bars() {
+        let dev = crate::device::G502Device::open().expect("设备未连接");
+        let indicator = IndicatorLed::new(&dev).expect("无 0x1300");
+        indicator.show_all().expect("show_all 失败");
     }
 
     #[test]
