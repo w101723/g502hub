@@ -157,6 +157,9 @@ pub struct Config {
     pub battery_poll_seconds: u64,
     #[serde(default = "default_threshold")]
     pub low_battery_threshold: u8,
+    /// 鼠标未连接时是否隐藏菜单栏托盘图标（默认 true）
+    #[serde(default = "default_hide_tray_when_disconnected")]
+    pub hide_tray_when_disconnected: bool,
 }
 
 fn default_dpi_levels() -> Vec<u16> {
@@ -167,6 +170,9 @@ fn default_poll() -> u64 {
 }
 fn default_threshold() -> u8 {
     15
+}
+fn default_hide_tray_when_disconnected() -> bool {
+    true
 }
 
 impl Config {
@@ -226,6 +232,7 @@ impl Default for Config {
             led_zones,
             battery_poll_seconds: default_poll(),
             low_battery_threshold: default_threshold(),
+            hide_tray_when_disconnected: true,
         }
     }
 }
@@ -326,11 +333,24 @@ mod tests {
         let spec = cfg.led_zones.get("primary").unwrap();
         assert_eq!(spec.rate, None);
         assert_eq!(spec.brightness, 80);
+        assert!(cfg.hide_tray_when_disconnected);
     }
 
     #[test]
     fn test_default_has_no_profiles() {
         assert!(Config::default().profiles.is_empty());
+        assert!(Config::default().hide_tray_when_disconnected);
+    }
+
+    #[test]
+    fn test_hide_tray_config_serde() {
+        let json = r#"{"hide_tray_when_disconnected": false}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(!cfg.hide_tray_when_disconnected);
+
+        let json_default = r#"{}"#;
+        let cfg_default: Config = serde_json::from_str(json_default).unwrap();
+        assert!(cfg_default.hide_tray_when_disconnected);
     }
 
     #[test]

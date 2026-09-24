@@ -83,6 +83,8 @@ struct Core {
 struct App {
     state: Arc<Mutex<State>>,
     tray: TrayIcon,
+    tray_visible: bool,
+    ticks: u32,
     tap: Arc<MacroTap>,
     cfg: Config,
     // ---- 常驻菜单项(原地更新) ----
@@ -1077,6 +1079,10 @@ fn publish_offline(state: &Arc<Mutex<State>>, error: String) {
     }
 }
 
+fn is_device_connected(snap: &Snapshot) -> bool {
+    snap.device_desc.is_some() && snap.battery.is_some()
+}
+
 fn keep_online_after_battery_failure(failures: u8, interface_present: bool) -> bool {
     failures < 2 && interface_present
 }
@@ -1225,13 +1231,30 @@ fn poll_loop(state: Arc<Mutex<State>>, led_sync_pending: Arc<AtomicBool>) {
 
 #[cfg(test)]
 mod connection_tests {
-    use super::keep_online_after_battery_failure;
+    use super::*;
 
     #[test]
     fn temporary_battery_failure_keeps_device_visible() {
         assert!(keep_online_after_battery_failure(1, true));
         assert!(!keep_online_after_battery_failure(2, true));
         assert!(!keep_online_after_battery_failure(1, false));
+    }
+
+    #[test]
+    fn test_is_device_connected() {
+        let mut snap = Snapshot::default();
+        assert!(!is_device_connected(&snap));
+
+        snap.device_desc = Some("G502 LIGHTSPEED".into());
+        assert!(!is_device_connected(&snap));
+
+        snap.battery = Some(BatteryInfo {
+            percent: 80,
+            charging: false,
+            voltage_mv: Some(3900),
+            state_text: "放电中".into(),
+        });
+        assert!(is_device_connected(&snap));
     }
 }
 
@@ -1321,9 +1344,18 @@ pub fn run() -> Result<()> {
         .build()?;
     tray.set_title::<&str>(None);
 
+    let initial_connected = is_device_connected(&initial_snap);
+    let initial_visible = if cfg.hide_tray_when_disconnected {
+        initial_connected
+    } else {
+        true
+    };
+
     let mut app = App {
         state: state.clone(),
         tray,
+        tray_visible: initial_visible,
+        ticks: 0,
         tap: tap.clone(),
         cfg: cfg.clone(),
         header: MenuItem::with_id("noop", "", false, None),
@@ -1348,6 +1380,9 @@ pub fn run() -> Result<()> {
     {
         let snap = state.lock().unwrap().snap.clone();
         app.refresh_menu(&snap);
+    }
+    if !app.tray_visible {
+        let _ = app.tray.set_visible(false);
     }
 
     // 初始化控制中心浮窗
@@ -1436,24 +1471,53 @@ extern "C" fn pump_callback(_timer: CFRunLoopTimerRef, info: *mut std::ffi::c_vo
         }
     }
 
+    app.ticks = app.ticks.wrapping_add(1);
+    let periodic_check = app.ticks % 5 == 0; // 每秒检查一次配置变更
+
+    if periodic_check {
+        if let Ok(cfg) = config::load() {
+            app.cfg = cfg;
+        }
+    }
+
     // 3. 状态变化 → 快照后原地刷新(不持锁渲染)
-    let snap = {
+    let (snap, is_dirty) = {
         let mut st = match app.state.try_lock() {
             Ok(st) => st,
             Err(_) => return, // 轮询线程正持有锁,下个 0.2s 周期再来
         };
-        if st.dirty || recording_changed {
+        let dirty = st.dirty || recording_changed;
+        if dirty {
             st.dirty = false;
-            Some(st.snap.clone())
+            (Some(st.snap.clone()), true)
+        } else if periodic_check {
+            (Some(st.snap.clone()), false)
         } else {
-            None
+            (None, false)
         }
     };
     if let Some(snap) = snap {
-        app.tray.set_title::<&str>(None);
-        if let Ok(icon) = make_icon(&snap) {
-            let _ = app.tray.set_icon_with_as_template(Some(icon), true);
+        let connected = is_device_connected(&snap);
+        let target_visible = if app.cfg.hide_tray_when_disconnected {
+            connected
+        } else {
+            true
+        };
+
+        let vis_changed = target_visible != app.tray_visible;
+        if vis_changed {
+            let _ = app.tray.set_visible(target_visible);
+            app.tray_visible = target_visible;
         }
-        app.refresh_menu(&snap);
+
+        if is_dirty || vis_changed {
+            if app.tray_visible {
+                app.tray.set_title::<&str>(None);
+                if let Ok(icon) = make_icon(&snap) {
+                    let _ = app.tray.set_icon_with_as_template(Some(icon), true);
+                }
+            }
+            app.refresh_menu(&snap);
+        }
     }
 }
