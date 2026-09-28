@@ -244,6 +244,13 @@ pub fn config_path() -> PathBuf {
         .join("config.json")
 }
 
+pub fn battery_state_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home)
+        .join("Library/Application Support/g502hub")
+        .join("battery_state.json")
+}
+
 fn load_unlocked() -> Result<Config> {
     let path = config_path();
     if !path.exists() {
