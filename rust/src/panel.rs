@@ -93,6 +93,18 @@ unsafe fn draw_text_at_center(text: &str, cx: f64, cy: f64, font: &NSFont, color
     let _: () = msg_send![&*s, drawInRect: rect, withAttributes: &*dict];
 }
 
+/// 在指定左侧 X 与指定垂直中心坐标 cy 处精准垂直居中绘制文本
+unsafe fn draw_text_left_centered_y(text: &str, x: f64, cy: f64, font: &NSFont, color: &NSColor) {
+    let s = NSString::from_str(text);
+    let dict = make_text_attrs(font, color);
+    let size: NSSize = msg_send![&*s, sizeWithAttributes: &*dict];
+    let rect = NSRect::new(
+        NSPoint::new(x, cy - size.height * 0.5),
+        NSSize::new(size.width + 2.0, size.height),
+    );
+    let _: () = msg_send![&*s, drawInRect: rect, withAttributes: &*dict];
+}
+
 /// 渲染一张 SF Symbol 图标 (按最长边缩放到 point_size 并着色)。
 /// 返回的图像尺寸与符号纵横比一致，避免拉伸变形。
 #[allow(deprecated)]
@@ -308,6 +320,8 @@ declare_class!(
             let sel = self.ivars().selected.get();
             let hov = self.ivars().hovered.get();
             unsafe {
+                let cy = h * 0.5;
+
                 if sel {
                     let path =
                         NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bounds, 8.0, 8.0);
@@ -317,8 +331,9 @@ declare_class!(
                     path.setLineWidth(1.0);
                     path.stroke();
 
-                    // 左侧罗技青活力指示条 (强化选中感)
-                    let bar_rect = NSRect::new(NSPoint::new(3.5, 9.0), NSSize::new(3.5, h - 18.0));
+                    // 左侧罗技青活力指示条 (强化选中感，垂直居中)
+                    let bar_h = 24.0;
+                    let bar_rect = NSRect::new(NSPoint::new(3.5, cy - bar_h * 0.5), NSSize::new(3.5, bar_h));
                     let bar = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bar_rect, 1.75, 1.75);
                     PopoverPanel::color_accent().setFill();
                     bar.fill();
@@ -332,6 +347,8 @@ declare_class!(
                     path.stroke();
                 }
 
+                // 统一图标列水平中心线 (icon_cx = 21.0)，确保不同长宽比图标几何中心严格对齐
+                let icon_cx = 21.0;
                 let icon = if sel {
                     self.ivars().icon_selected.borrow().clone()
                 } else {
@@ -340,7 +357,7 @@ declare_class!(
                 let icon_size = icon.size();
                 if icon_size.width > 0.5 {
                     let icon_rect = NSRect::new(
-                        NSPoint::new(12.0, (h - icon_size.height) * 0.5),
+                        NSPoint::new(icon_cx - icon_size.width * 0.5, cy - icon_size.height * 0.5),
                         NSSize::new(icon_size.width, icon_size.height),
                     );
                     icon.drawInRect(icon_rect);
@@ -355,7 +372,8 @@ declare_class!(
                     PopoverPanel::color_primary_text()
                 };
                 let title = self.ivars().title.borrow().clone();
-                draw_text_left(&title, 38.0, (h - 16.0) * 0.5, &font, &color);
+                // 文字起始 X = 38.0，垂直中心与图标中心 cy 严格对齐
+                draw_text_left_centered_y(&title, 38.0, cy, &font, &color);
             }
         }
 
@@ -1591,6 +1609,7 @@ impl PopoverPanel {
         unsafe {
             nav_label_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
             nav_label_row.setAlignment(NSLayoutAttribute::CenterY);
+            nav_label_row.setSpacing(0.0);
             nav_label_row
                 .widthAnchor()
                 .constraintEqualToConstant(sidebar_inner_width)
@@ -1604,7 +1623,7 @@ impl PopoverPanel {
         unsafe {
             nav_label_spacer
                 .widthAnchor()
-                .constraintEqualToConstant(14.0)
+                .constraintEqualToConstant(12.0)
                 .setActive(true);
             nav_label_row.addArrangedSubview(&nav_label_spacer);
         }
@@ -1613,6 +1632,10 @@ impl PopoverPanel {
             nav_label.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
             nav_label.setTextColor(Some(&Self::color_idle_gray()));
             nav_label_row.addArrangedSubview(&nav_label);
+        }
+        let nav_label_tail = unsafe { Self::create_horizontal_spacer(mtm) };
+        unsafe {
+            nav_label_row.addArrangedSubview(&nav_label_tail);
             sidebar_stack.addArrangedSubview(&nav_label_row);
         }
 
