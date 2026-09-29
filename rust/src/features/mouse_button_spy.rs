@@ -86,13 +86,21 @@ fn parse_button_bitmap(report: &[u8], dev_index: u8, feature_index: u8) -> Optio
     Some(u16::from_be_bytes([report[4], report[5]]))
 }
 
+fn logical_button(hardware_button: u32) -> u32 {
+    match hardware_button {
+        9 => 10,
+        10 => 9,
+        _ => hardware_button,
+    }
+}
+
 fn changed_buttons(previous: u16, current: u16, count: u8) -> Vec<(u32, bool)> {
     let changed = previous ^ current;
     let mut events = Vec::new();
     for slot in 0..usize::from(count.min(MAX_BUTTONS as u8)) {
         let mask = 1u16 << slot;
         if changed & mask != 0 {
-            events.push((slot as u32, current & mask != 0));
+            events.push((logical_button(slot as u32), current & mask != 0));
         }
     }
     events
@@ -252,8 +260,13 @@ mod tests {
     fn maps_lsb_to_g1_and_msb_to_g16() {
         assert_eq!(changed_buttons(0, 0x0001, 16), vec![(0, true)]);
         assert_eq!(changed_buttons(0, 0x0008, 16), vec![(3, true)]);
-        assert_eq!(changed_buttons(0, 0x0200, 16), vec![(9, true)]);
         assert_eq!(changed_buttons(0, 0x8000, 16), vec![(15, true)]);
+    }
+
+    #[test]
+    fn swaps_hardware_wheel_tilt_slots_to_logical_g10_g11() {
+        assert_eq!(changed_buttons(0, 0x0200, 16), vec![(10, true)]);
+        assert_eq!(changed_buttons(0, 0x0400, 16), vec![(9, true)]);
     }
 
     #[test]
