@@ -14,10 +14,10 @@ const KNOWN: &[(u16, &str)] = &[
     (0x1300, "LedSoftwareControl"),
     (0x2200, "MousePointerBasic"),
     (0x2201, "AdjustableDPI"),
-    (0x2202, "MouseButtonSpy"),
     (0x8060, "ReportRate"),
     (0x8070, "ColorLEDEffects"),
     (0x8100, "OnboardProfiles"),
+    (0x8110, "MouseButtonSpy"),
 ];
 
 fn known_name(id: u16) -> &'static str {
@@ -214,6 +214,9 @@ pub fn run(what: &str) -> Result<()> {
     }
     if what == "all" || what == "onboard" {
         raw_probe(&dev, 0x8100);
+    }
+    if what == "button-spy" {
+        raw_probe(&dev, 0x8110);
     }
     Ok(())
 }

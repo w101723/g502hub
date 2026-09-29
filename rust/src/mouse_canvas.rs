@@ -104,8 +104,8 @@ pub fn point_in_polygon(px: f64, py: f64, poly: &[(f64, f64)]) -> bool {
 /// 计算等比居中的鼠标绘制视口 (保持 G502 真实硬件高精比例)
 pub fn calc_viewport(w: f64, h: f64, mode: CanvasMode) -> (f64, f64, f64, f64) {
     let target_ratio = match mode {
-        CanvasMode::Top => 850.0 / 872.0,   // ~0.9748
-        CanvasMode::Side => 658.0 / 854.0,  // ~0.7705
+        CanvasMode::Top => 850.0 / 872.0,  // ~0.9748
+        CanvasMode::Side => 658.0 / 854.0, // ~0.7705
     };
     let dh = (h * 0.90).min(h - 14.0);
     let dw = dh * target_ratio;
@@ -380,21 +380,10 @@ declare_class!(
             let bound_set = self.ivars().bound_keys.borrow().clone();
 
             unsafe {
-                // 1. macOS 系统简约纯净浅灰底板 (#F7F7FA + 细边框 #E2E2E8)
-                let bg_color =
-                    NSColor::colorWithSRGBRed_green_blue_alpha(0.968, 0.968, 0.980, 1.0);
-                bg_color.setFill();
-                let bg_path =
-                    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bounds, 10.0, 10.0);
-                bg_path.fill();
+                // 1. 透明底板：由外层白色卡片 (NSBox #FFFFFF) 提供背景，
+                //    对齐 macOS 设置窗口的卡片式层次 (参考设计稿 .diagram card)。
 
-                // 2. 简约精致边框线 (#E2E2E8)
-                let rim = NSColor::colorWithSRGBRed_green_blue_alpha(0.886, 0.886, 0.910, 1.0);
-                rim.setStroke();
-                bg_path.setLineWidth(1.0);
-                bg_path.stroke();
-
-                // 3. 计算等比居中视口 (避免在宽屏拉伸变形)
+                // 2. 计算等比居中视口 (避免在宽屏拉伸变形)
                 let (dw, dh, ox, oy) = calc_viewport(w, h, mode);
 
                 // 4. 绘制 G502 原生高精实机机身渲染图
@@ -472,7 +461,14 @@ impl G502MouseCanvas {
     }
 
     /// 计算指定按键在画布中的药丸徽章外接矩形
-    pub fn badge_rect_for_zone(w: f64, dw: f64, dh: f64, ox: f64, oy: f64, z: &ZonePolygon) -> NSRect {
+    pub fn badge_rect_for_zone(
+        w: f64,
+        dw: f64,
+        dh: f64,
+        ox: f64,
+        oy: f64,
+        z: &ZonePolygon,
+    ) -> NSRect {
         let badge_w = 90.0;
         let badge_h = 22.0;
         let bx = if z.badge_left {
@@ -513,7 +509,8 @@ impl G502MouseCanvas {
         for z in zones {
             let hx = ox + z.hotspot.0 * dw;
             let hy = oy + z.hotspot.1 * dh;
-            let dist_sq = (local_pt.x - hx) * (local_pt.x - hx) + (local_pt.y - hy) * (local_pt.y - hy);
+            let dist_sq =
+                (local_pt.x - hx) * (local_pt.x - hx) + (local_pt.y - hy) * (local_pt.y - hy);
             if dist_sq <= 16.0 * 16.0 {
                 return Some(z.key);
             }
@@ -558,26 +555,26 @@ impl G502MouseCanvas {
         // 1. 色彩管线 (macOS 系统简约明亮风格规范)
         let (stroke_c, tag_bg_c, tag_fg_c) = if is_selected {
             (
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.443, 0.890, 1.0),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.443, 0.890, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.478, 1.0, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.478, 1.0, 1.0),
                 NSColor::whiteColor(),
             )
         } else if is_hovered {
             (
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.443, 0.890, 1.0),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.92, 0.96, 1.0, 1.0),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.443, 0.890, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.478, 1.0, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.90, 0.955, 1.0, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.478, 1.0, 1.0),
             )
         } else if is_bound {
             (
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.204, 0.780, 0.349, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.188, 0.820, 0.345, 1.0),
                 NSColor::colorWithSRGBRed_green_blue_alpha(0.93, 0.98, 0.94, 1.0),
                 NSColor::colorWithSRGBRed_green_blue_alpha(0.106, 0.400, 0.150, 1.0),
             )
         } else {
             (
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.78, 0.80, 0.84, 1.0),
-                NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.855, 0.855, 0.878, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.949, 0.949, 0.961, 1.0),
                 NSColor::colorWithSRGBRed_green_blue_alpha(0.114, 0.114, 0.122, 1.0),
             )
         };
@@ -659,14 +656,43 @@ impl G502MouseCanvas {
         badge_path.setLineWidth(if is_selected { 1.5 } else { 1.0 });
         badge_path.stroke();
 
-        // 7. 徽章内部高对比度文字
-        let font = NSFont::boldSystemFontOfSize(10.5);
-        let label_text = format!("{} · {}", zone.key, zone.desc);
-        let text_rect = NSRect::new(
-            NSPoint::new(bx + 5.0, by + 3.0),
-            NSSize::new(badge_w - 10.0, badge_h - 4.0),
+        // 7. 徽章内部双段文字: 按键代号 (灰) + 功能名 (主色)，对齐设计稿 .pill .k / .f
+        let key_color = if is_selected {
+            NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.92)
+        } else {
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.431, 0.431, 0.451, 1.0)
+        };
+        let key_font = NSFont::boldSystemFontOfSize(10.5);
+        let key_rect = NSRect::new(
+            NSPoint::new(bx + 7.0, by + 3.0),
+            NSSize::new(badge_w - 14.0, badge_h - 5.0),
         );
-        Self::draw_text(&label_text, text_rect, &font, &tag_fg_c);
+        Self::draw_text(zone.key, key_rect, &key_font, &key_color);
+
+        let key_w: f64 = {
+            let s = NSString::from_str(zone.key);
+            let dict = Self::text_attributes(&key_font, &key_color);
+            let size: NSSize = msg_send![&*s, sizeWithAttributes: &*dict];
+            size.width
+        };
+        let desc_font = NSFont::systemFontOfSize(11.0);
+        let desc_rect = NSRect::new(
+            NSPoint::new(bx + 9.0 + key_w, by + 2.5),
+            NSSize::new(badge_w - 16.0 - key_w, badge_h - 4.0),
+        );
+        Self::draw_text(zone.desc, desc_rect, &desc_font, &tag_fg_c);
+    }
+
+    /// 构建文本绘制属性字典 (字体 + 前景色)
+    unsafe fn text_attributes(
+        font: &NSFont,
+        color: &NSColor,
+    ) -> Retained<NSMutableDictionary<objc2::runtime::AnyObject, objc2::runtime::AnyObject>> {
+        let dict =
+            NSMutableDictionary::<objc2::runtime::AnyObject, objc2::runtime::AnyObject>::new();
+        let _: () = msg_send![&dict, setObject: &*font, forKey: NSFontAttributeName];
+        let _: () = msg_send![&dict, setObject: &*color, forKey: NSForegroundColorAttributeName];
+        dict
     }
 }
 

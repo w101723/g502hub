@@ -7,6 +7,7 @@ use crate::device::G502Device;
 use crate::features::dpi::Dpi;
 use crate::features::indicator_led::IndicatorLed;
 use crate::features::led::{self, Led};
+use crate::features::mouse_button_spy;
 use crate::features::onboard::{get_onboard_mode, set_onboard_mode, OnboardMode};
 use crate::hidpp::HidppError;
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -28,19 +29,30 @@ pub fn with_device_lock<T>(f: impl FnOnce() -> Result<T, HidppError>) -> Result<
 }
 
 pub fn read_mode(dev: &G502Device) -> Result<OnboardMode, HidppError> {
-    match get_onboard_mode(dev) {
-        Some(r) => r,
-        None => Err(HidppError::Invalid(
-            "设备不支持板载模式 feature 0x8100".into(),
-        )),
+    let mode = match get_onboard_mode(dev) {
+        Some(r) => r?,
+        None => {
+            return Err(HidppError::Invalid(
+                "设备不支持板载模式 feature 0x8100".into(),
+            ))
+        }
+    };
+    if mode == OnboardMode::Host {
+        mouse_button_spy::start(dev)?;
     }
+    Ok(mode)
 }
 
 pub fn set_mode_confirmed(dev: &G502Device, mode: OnboardMode) -> Result<OnboardMode, HidppError> {
     with_device_lock(|| {
+        if mode == OnboardMode::Onboard {
+            let _ = mouse_button_spy::stop(dev, true);
+        }
         let actual = set_onboard_mode(dev, mode)?;
         if actual == OnboardMode::Onboard {
             IndicatorLed::new(dev)?.release()?;
+        } else {
+            mouse_button_spy::start(dev)?;
         }
         Ok(actual)
     })
@@ -76,9 +88,12 @@ fn apply_desired_state_inner(dev: &G502Device, cfg: &Config) -> Result<AppliedSt
     };
 
     if mode == OnboardMode::Onboard {
+        let _ = mouse_button_spy::stop(dev, true);
         if let Ok(indicator) = IndicatorLed::new(dev) {
             let _ = indicator.release();
         }
+    } else {
+        mouse_button_spy::start(dev)?;
     }
 
     let dpi = if mode == OnboardMode::Host {

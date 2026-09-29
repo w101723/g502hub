@@ -5,4 +5,5 @@ pub mod battery_indicator;
 pub mod dpi;
 pub mod indicator_led;
 pub mod led;
+pub mod mouse_button_spy;
 pub mod onboard;

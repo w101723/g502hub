@@ -45,6 +45,10 @@ objc2-app-kit = { version = "0.2", features = [
     "NSFontDescriptor",
     "NSAppearance",
     "NSPasteboard",
+    "NSSwitch",
+    "NSImageView",
+    "NSBitmapImageRep",
+    "NSImageRep",
 ] }
 objc2-foundation = { version = "0.2", features = ["NSRunLoop", "NSNotification", "NSGeometry", "NSValue", "NSArray", "NSString", "NSDictionary", "NSData"] }
 core-graphics = "0.24"

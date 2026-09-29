@@ -6,7 +6,9 @@
 use crate::hidpp::{
     enumerate_vendor_interfaces, HidppError, InterfaceInfo, Transport, RECEIVER_PIDS,
 };
+use hidapi::HidDevice;
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -35,6 +37,7 @@ pub struct G502Device {
     pub dev_index: u8,
     pub pid: u16,
     pub slot: u8,
+    interface_path: CString,
     features: Mutex<HashMap<u16, u8>>,
 }
 
@@ -43,6 +46,7 @@ static CONN: std::sync::Mutex<Option<std::sync::Arc<G502Device>>> = std::sync::M
 /// 获取(或建立)持久设备连接,跨线程复用,避免每次操作重新枚举。
 /// retries>0 时鼠标休眠会重试等待唤醒。
 pub fn invalidate_connection() {
+    crate::features::mouse_button_spy::stop_local();
     if let Ok(mut conn) = CONN.lock() {
         *conn = None;
     }
@@ -172,6 +176,7 @@ impl G502Device {
                             dev_index: idx,
                             pid: info.pid,
                             slot: if is_receiver { idx } else { 0 },
+                            interface_path: info.path.clone(),
                             features: Mutex::new(HashMap::new()),
                         });
                     }
@@ -190,6 +195,28 @@ impl G502Device {
             msg.push_str("\n检测到 G HUB 正在后台运行,如持续失败请先完全退出 G HUB 再试。");
         }
         Err(HidppError::Open(msg))
+    }
+
+    pub fn interface_identity(&self) -> String {
+        format!(
+            "{}:{:#06x}:{:#04x}",
+            self.interface_path.to_string_lossy(),
+            self.pid,
+            self.dev_index
+        )
+    }
+
+    pub fn open_additional_handle(&self) -> Result<HidDevice, HidppError> {
+        let api = crate::hidpp::shared_api()
+            .lock()
+            .map_err(|_| HidppError::Open("HidApi 设备列表锁已损坏".into()))?;
+        api.open_path(self.interface_path.as_c_str())
+            .map_err(|error| {
+                HidppError::Open(format!(
+                    "打开 MouseButtonSpy 通知句柄失败 ({}): {error}",
+                    self.interface_path.to_string_lossy()
+                ))
+            })
     }
 
     pub fn request(

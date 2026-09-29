@@ -24,20 +24,26 @@ type CFMachPortRef = *mut c_void;
 type CFRunLoopRef = *mut c_void;
 type CFRunLoopSourceRef = *mut c_void;
 
-#[allow(dead_code)]
 const K_CG_HID_EVENT_TAP: u32 = 0;
 const K_CG_SESSION_EVENT_TAP: u32 = 1;
 const K_CG_EVENT_KEY_DOWN: u64 = 10;
 const K_CG_EVENT_KEY_UP: u64 = 11;
 const K_CG_EVENT_FLAGS_CHANGED: u64 = 12;
+const K_CG_EVENT_SCROLL_WHEEL: u64 = 22;
 const K_CG_EVENT_OTHER_MOUSE_DOWN: u64 = 25;
 const K_CG_EVENT_OTHER_MOUSE_UP: u64 = 26;
-const K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT: i64 = -2; // 0xFFFFFFFE as i64
-const K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: i64 = -1; // 0xFFFFFFFF as i64
+const K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = u32::MAX - 1;
+const K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = u32::MAX;
 const K_CG_MOUSE_EVENT_BUTTON_NUMBER: i32 = 3;
+const K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1: i32 = 11;
+const K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2: i32 = 12;
+const K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS: i32 = 88;
+const K_CG_SCROLL_WHEEL_EVENT_MOMENTUM_PHASE: i32 = 123;
 const K_CG_KEYBOARD_EVENT_KEYCODE: i32 = 9;
-const K_CG_EVENT_SOURCE_USER_DATA: i32 = 110;
+const K_CG_EVENT_SOURCE_USER_DATA: i32 = 42;
 const PLAYBACK_EVENT_TAG: i64 = 0x4750_3530_3248;
+const TAP_PROBE_EVENT_TAG: i64 = 0x4750_3530_3250;
+const K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION_STATE: i32 = 0;
 
 const FLAG_SHIFT: u64 = 1 << 17;
 const FLAG_CONTROL: u64 = 1 << 18;
@@ -55,6 +61,7 @@ extern "C" {
         user_info: *mut c_void,
     ) -> CFMachPortRef;
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
+    fn CGEventSourceCreate(source_state: i32) -> *mut c_void;
     fn CGEventCreateKeyboardEvent(source: *mut c_void, keycode: u16, keydown: bool) -> CGEventRef;
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventGetFlags(event: CGEventRef) -> u64;
@@ -62,6 +69,9 @@ extern "C" {
     fn CGEventGetIntegerValueField(event: CGEventRef, field: i32) -> i64;
     fn CGEventSetIntegerValueField(event: CGEventRef, field: i32, value: i64);
     fn CGEventKeyboardSetUnicodeString(event: CGEventRef, len: usize, s: *const u16);
+    fn CGPreflightListenEventAccess() -> bool;
+    fn CGRequestListenEventAccess() -> bool;
+    fn CGPreflightPostEventAccess() -> bool;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -102,6 +112,22 @@ pub fn accessibility_granted(prompt: bool) -> bool {
         vec![(key.into_CFType(), value.into_CFType())];
     let dict = CFDictionary::from_CFType_pairs(&pairs);
     unsafe { AXIsProcessTrustedWithOptions(dict.as_concrete_TypeRef() as *const c_void) }
+}
+
+pub fn input_monitoring_granted(prompt: bool) -> bool {
+    unsafe {
+        if CGPreflightListenEventAccess() {
+            true
+        } else if prompt {
+            CGRequestListenEventAccess()
+        } else {
+            false
+        }
+    }
+}
+
+pub fn event_posting_granted() -> bool {
+    unsafe { CGPreflightPostEventAccess() }
 }
 
 #[allow(dead_code)]
@@ -351,32 +377,90 @@ fn parse_combo(spec: &str) -> Result<(u64, u16)> {
         .ok_or_else(|| anyhow!("无法解析按键: {spec}"))
 }
 
+fn modifier_events(flags: u64) -> Vec<(u64, u16)> {
+    [
+        (FLAG_CONTROL, 59),
+        (FLAG_ALTERNATE, 58),
+        (FLAG_SHIFT, 56),
+        (FLAG_COMMAND, 55),
+    ]
+    .into_iter()
+    .filter(|(flag, _)| flags & flag != 0)
+    .collect()
+}
+
+unsafe fn post_tap_probe() -> Result<()> {
+    let source = CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION_STATE);
+    let event = CGEventCreateKeyboardEvent(source, u16::MAX, true);
+    if event.is_null() {
+        if !source.is_null() {
+            CFRelease(source);
+        }
+        return Err(anyhow!("CGEventCreateKeyboardEvent 自检事件创建失败"));
+    }
+    CGEventSetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA, TAP_PROBE_EVENT_TAG);
+    CGEventPost(K_CG_HID_EVENT_TAP, event);
+    CFRelease(event);
+    if !source.is_null() {
+        CFRelease(source);
+    }
+    Ok(())
+}
+
+unsafe fn post_keyboard_event(code: u16, down: bool, flags: u64) -> Result<()> {
+    let source = CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION_STATE);
+    let event = CGEventCreateKeyboardEvent(source, code, down);
+    if event.is_null() {
+        if !source.is_null() {
+            CFRelease(source);
+        }
+        return Err(anyhow!("CGEventCreateKeyboardEvent 失败: keycode={code}"));
+    }
+    let current_flags = CGEventGetFlags(event);
+    let modifier_mask = FLAG_SHIFT | FLAG_CONTROL | FLAG_ALTERNATE | FLAG_COMMAND;
+    CGEventSetFlags(event, (current_flags & !modifier_mask) | flags);
+    CGEventSetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA, PLAYBACK_EVENT_TAG);
+    CGEventPost(K_CG_SESSION_EVENT_TAP, event);
+    CFRelease(event);
+    if !source.is_null() {
+        CFRelease(source);
+    }
+    Ok(())
+}
+
 fn tap_key(spec: &str) -> Result<()> {
     let (flags, keycode) = parse_combo(spec)?;
-    unsafe {
-        let down = CGEventCreateKeyboardEvent(std::ptr::null_mut(), keycode, true);
-        if down.is_null() {
-            return Err(anyhow!("CGEventCreateKeyboardEvent down 失败"));
-        }
-        if flags != 0 {
-            CGEventSetFlags(down, flags);
-        }
-        CGEventSetIntegerValueField(down, K_CG_EVENT_SOURCE_USER_DATA, PLAYBACK_EVENT_TAG);
-        CGEventPost(K_CG_SESSION_EVENT_TAP, down);
-        CFRelease(down);
+    let modifiers = modifier_events(flags);
 
-        let up = CGEventCreateKeyboardEvent(std::ptr::null_mut(), keycode, false);
-        if up.is_null() {
-            return Err(anyhow!("CGEventCreateKeyboardEvent up 失败"));
-        }
-        if flags != 0 {
-            CGEventSetFlags(up, flags);
-        }
-        CGEventSetIntegerValueField(up, K_CG_EVENT_SOURCE_USER_DATA, PLAYBACK_EVENT_TAG);
-        CGEventPost(K_CG_SESSION_EVENT_TAP, up);
-        CFRelease(up);
+    // 依照罗技 G HUB 硬件模拟规范时序(每步保持 30~50ms 真实物理等待):
+    // 1. 依次按下修饰键，带上累积修饰键掩码
+    let mut active = 0;
+    for &(flag, code) in &modifiers {
+        active |= flag;
+        unsafe { post_keyboard_event(code, true, active)? };
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+
+    // 2. 按下目标主键(带完整组合键掩码)
+    unsafe {
+        post_keyboard_event(keycode, true, flags)?;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // 3. 释放目标主键
+    unsafe {
+        post_keyboard_event(keycode, false, flags)?;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(30));
+
+    // 4. 逆序释放修饰键
+    for &(flag, code) in modifiers.iter().rev() {
+        active &= !flag;
+        unsafe { post_keyboard_event(code, false, active)? };
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
     std::thread::sleep(std::time::Duration::from_millis(20));
+
     Ok(())
 }
 
@@ -387,8 +471,12 @@ fn type_text_cgevent(text: &str) -> Result<()> {
     }
     for chunk in utf16.chunks(20) {
         unsafe {
-            let down = CGEventCreateKeyboardEvent(std::ptr::null_mut(), 0, true);
+            let source = CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION_STATE);
+            let down = CGEventCreateKeyboardEvent(source, 0, true);
             if down.is_null() {
+                if !source.is_null() {
+                    CFRelease(source);
+                }
                 return Err(anyhow!("CGEventCreateKeyboardEvent down 失败"));
             }
             CGEventKeyboardSetUnicodeString(down, chunk.len(), chunk.as_ptr());
@@ -396,14 +484,20 @@ fn type_text_cgevent(text: &str) -> Result<()> {
             CGEventPost(K_CG_SESSION_EVENT_TAP, down);
             CFRelease(down);
 
-            let up = CGEventCreateKeyboardEvent(std::ptr::null_mut(), 0, false);
+            let up = CGEventCreateKeyboardEvent(source, 0, false);
             if up.is_null() {
+                if !source.is_null() {
+                    CFRelease(source);
+                }
                 return Err(anyhow!("CGEventCreateKeyboardEvent up 失败"));
             }
             CGEventKeyboardSetUnicodeString(up, chunk.len(), chunk.as_ptr());
             CGEventSetIntegerValueField(up, K_CG_EVENT_SOURCE_USER_DATA, PLAYBACK_EVENT_TAG);
             CGEventPost(K_CG_SESSION_EVENT_TAP, up);
             CFRelease(up);
+            if !source.is_null() {
+                CFRelease(source);
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(15));
     }
@@ -501,22 +595,12 @@ pub fn play(actions: &[Action]) -> Result<()> {
                 Some(false) => &[false],
                 None => &[true, false],
             };
-            unsafe {
-                for &keydown in states {
-                    let event =
-                        CGEventCreateKeyboardEvent(std::ptr::null_mut(), kc as u16, keydown);
-                    if !event.is_null() {
-                        if flags != 0 {
-                            CGEventSetFlags(event, flags);
-                        }
-                        CGEventSetIntegerValueField(
-                            event,
-                            K_CG_EVENT_SOURCE_USER_DATA,
-                            PLAYBACK_EVENT_TAG,
-                        );
-                        CGEventPost(K_CG_SESSION_EVENT_TAP, event);
-                        CFRelease(event);
-                    }
+            for (idx, &keydown) in states.iter().enumerate() {
+                unsafe {
+                    post_keyboard_event(kc as u16, keydown, flags)?;
+                }
+                if idx + 1 < states.len() {
+                    std::thread::sleep(std::time::Duration::from_millis(40));
                 }
             }
         }
@@ -551,9 +635,15 @@ static GLOBAL_BINDINGS: RwLock<Option<MacroBindings>> = RwLock::new(None);
 static TAP_PORT: RwLock<usize> = RwLock::new(0); // CFMachPortRef as usize
 static TAP_RUNLOOP: RwLock<usize> = RwLock::new(0); // CFRunLoopRef as usize
 static TAP_SOURCE: RwLock<usize> = RwLock::new(0); // CFRunLoopSourceRef as usize
-static PLAYBACK_TX: RwLock<Option<mpsc::Sender<Vec<Action>>>> = RwLock::new(None);
+static PLAYBACK_TX: RwLock<Option<mpsc::Sender<(String, Vec<Action>)>>> = RwLock::new(None);
 static LAST_BUTTON: AtomicI64 = AtomicI64::new(-1);
 static RECORDING_SERIAL: AtomicU64 = AtomicU64::new(0);
+static TAP_RECOVERY_COUNT: AtomicU64 = AtomicU64::new(0);
+static TAP_PROBE_SEEN: AtomicBool = AtomicBool::new(false);
+static RAW_EVENT_SERIAL: AtomicU64 = AtomicU64::new(0);
+static RAW_EVENT_KIND: AtomicI64 = AtomicI64::new(0);
+static RAW_EVENT_VALUE_1: AtomicI64 = AtomicI64::new(0);
+static RAW_EVENT_VALUE_2: AtomicI64 = AtomicI64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingKind {
@@ -789,6 +879,10 @@ pub fn get_binding_for_key(button_key: &str) -> Option<MacroBinding> {
     None
 }
 
+pub fn can_save_text_binding(editable: bool, binding: Option<&MacroBinding>) -> bool {
+    editable && binding.is_none_or(|binding| get_binding_text(binding).is_some())
+}
+
 pub fn get_binding_text(binding: &MacroBinding) -> Option<String> {
     for a in &binding.actions {
         if a.device_action.is_some() {
@@ -802,6 +896,7 @@ pub fn get_binding_text(binding: &MacroBinding) -> Option<String> {
 }
 
 pub fn save_text_binding(button_key: &str, text: &str) -> Result<()> {
+    // 仅用 trim 判空与生成展示名;实际存储/回放必须保留前后空格。
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return clear_binding(button_key);
@@ -810,7 +905,7 @@ pub fn save_text_binding(button_key: &str, text: &str) -> Result<()> {
         name: Some(format!("文字: \"{trimmed}\"")),
         enabled: true,
         actions: vec![Action {
-            text: Some(trimmed.to_string()),
+            text: Some(text.to_string()),
             ..Action::default()
         }],
     };
@@ -845,6 +940,41 @@ pub fn clear_binding(button_key: &str) -> Result<()> {
         tap.update_bindings(macros);
     }
     Ok(())
+}
+
+pub fn format_recorded_keys(binding: &MacroBinding) -> Option<String> {
+    if binding.name.as_deref()?.starts_with("录制快捷键:") {
+        if let Some(keys) = binding
+            .actions
+            .iter()
+            .find_map(|action| action.keys.as_deref())
+        {
+            return Some(keys.to_string());
+        }
+        let action = binding.actions.first()?;
+        let code = action.keycode?;
+        let key = keycode_name(code as u16)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("keycode {code}"));
+        let mut parts = action.modifiers.clone();
+        parts.push(key);
+        return Some(parts.join("+"));
+    }
+    if !binding.name.as_deref()?.starts_with("录制按键序列:") {
+        return None;
+    }
+    let keys: Vec<_> = binding
+        .actions
+        .iter()
+        .filter(|action| action.key_down == Some(true))
+        .filter_map(|action| action.keycode)
+        .map(|code| {
+            keycode_name(code as u16)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("keycode {code}"))
+        })
+        .collect();
+    (!keys.is_empty()).then(|| keys.join(" → "))
 }
 
 pub fn format_binding_summary(binding: &MacroBinding) -> String {
@@ -1082,33 +1212,74 @@ impl MacroTap {
         }
 
         // 1. 启动单一播放队列工作线程
-        let (tx, rx) = mpsc::channel::<Vec<Action>>();
+        let (tx, rx) = mpsc::channel::<(String, Vec<Action>)>();
         *PLAYBACK_TX.write().unwrap() = Some(tx);
         let playback_thread = std::thread::Builder::new()
             .name("g502-macro-playback".into())
             .spawn(move || {
-                while let Ok(actions) = rx.recv() {
-                    if let Err(e) = play(&actions) {
-                        mlog(&format!("playback ERR: {e}"));
+                let mut raw_serial = RAW_EVENT_SERIAL.load(Ordering::Relaxed);
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok((key, actions)) => {
+                            mlog(&format!("绑定命中: {key}, 回放 {} 个动作", actions.len()));
+                            if let Err(e) = play(&actions) {
+                                mlog(&format!("回放失败: {key}: {e}"));
+                            } else {
+                                mlog(&format!("回放已发送: {key}"));
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let current_serial = RAW_EVENT_SERIAL.load(Ordering::Acquire);
+                    if current_serial != raw_serial {
+                        raw_serial = current_serial;
+                        let kind = RAW_EVENT_KIND.load(Ordering::Relaxed);
+                        let value_1 = RAW_EVENT_VALUE_1.load(Ordering::Relaxed);
+                        let value_2 = RAW_EVENT_VALUE_2.load(Ordering::Relaxed);
+                        match kind {
+                            1 => mlog(&format!("原始鼠标事件:button={value_1},down")),
+                            2 => mlog(&format!("原始鼠标事件:button={value_1},up")),
+                            3 => mlog(&format!(
+                                "原始滚轮事件:vertical={value_1},horizontal={value_2}"
+                            )),
+                            _ => {}
+                        }
                     }
                 }
             })?;
 
         // 2. 创建 CGEventTap
-        let mask = (1u64 << K_CG_EVENT_OTHER_MOUSE_DOWN)
+        let mask = (1u64 << K_CG_EVENT_SCROLL_WHEEL)
+            | (1u64 << K_CG_EVENT_OTHER_MOUSE_DOWN)
             | (1u64 << K_CG_EVENT_OTHER_MOUSE_UP)
             | (1u64 << K_CG_EVENT_KEY_DOWN)
             | (1u64 << K_CG_EVENT_KEY_UP)
             | (1u64 << K_CG_EVENT_FLAGS_CHANGED);
-        let tap = unsafe {
-            CGEventTapCreate(
-                K_CG_SESSION_EVENT_TAP,
+        let (tap, tap_location) = unsafe {
+            let hid_tap = CGEventTapCreate(
+                K_CG_HID_EVENT_TAP,
                 0, // head insert
                 0, // active tap(可吞键)
                 mask,
                 tap_callback,
                 std::ptr::null_mut(),
-            )
+            );
+            if hid_tap.is_null() {
+                (
+                    CGEventTapCreate(
+                        K_CG_SESSION_EVENT_TAP,
+                        0,
+                        0,
+                        mask,
+                        tap_callback,
+                        std::ptr::null_mut(),
+                    ),
+                    K_CG_SESSION_EVENT_TAP,
+                )
+            } else {
+                (hid_tap, K_CG_HID_EVENT_TAP)
+            }
         };
         if tap.is_null() {
             // 清理已创建的播放通道
@@ -1120,7 +1291,14 @@ impl MacroTap {
             return Err(anyhow!("CGEventTapCreate 失败:需要辅助功能权限"));
         }
 
-        mlog("tap created OK(拦截引擎启动)");
+        mlog(&format!(
+            "tap created OK(拦截引擎启动,location={})",
+            if tap_location == K_CG_HID_EVENT_TAP {
+                "HID"
+            } else {
+                "session"
+            }
+        ));
         *TAP_PORT.write().unwrap() = tap as usize;
         self.running.store(true, Ordering::Relaxed);
 
@@ -1163,7 +1341,34 @@ impl MacroTap {
                     runloop_thread: Some(runloop_thread),
                     playback_thread: Some(playback_thread),
                 });
-                Ok(())
+                drop(th);
+
+                TAP_PROBE_SEEN.store(false, Ordering::Release);
+                unsafe { post_tap_probe()? };
+                for _ in 0..20 {
+                    if TAP_PROBE_SEEN.load(Ordering::Acquire) {
+                        let enabled_keys = self
+                            .bindings
+                            .read()
+                            .map(|bindings| {
+                                bindings
+                                    .iter()
+                                    .filter(|(_, binding)| binding.enabled)
+                                    .map(|(key, _)| key.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            })
+                            .unwrap_or_else(|_| "<读取失败>".to_string());
+                        mlog(&format!(
+                            "tap 自检通过:事件回调链路正常,启用绑定=[{enabled_keys}]"
+                        ));
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                mlog("tap 自检失败:事件未进入回调");
+                self.stop();
+                Err(anyhow!("CGEventTap 自检失败:事件未进入回调"))
             }
             Ok(Err(e)) => {
                 self.stop();
@@ -1486,25 +1691,33 @@ fn record_keyboard(etype: u64, code: u16, flags: u64) -> bool {
     }
 }
 
+fn is_tap_disabled_event(etype: u32) -> bool {
+    etype == K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT || etype == K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT
+}
+
 unsafe fn tap_callback_inner(
     _proxy: *mut c_void,
     etype: u32,
     event: CGEventRef,
     _user_info: *mut c_void,
 ) -> CGEventRef {
-    if etype as i64 == K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT
-        || etype as i64 == K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT
-    {
+    if is_tap_disabled_event(etype) {
         if let Ok(guard) = TAP_PORT.read() {
             let port = *guard;
             if port != 0 {
                 CGEventTapEnable(port as CFMachPortRef, true);
             }
         }
+        TAP_RECOVERY_COUNT.fetch_add(1, Ordering::Relaxed);
         return event;
     }
 
-    if CGEventGetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA) == PLAYBACK_EVENT_TAG {
+    let event_tag = CGEventGetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA);
+    if event_tag == TAP_PROBE_EVENT_TAG {
+        TAP_PROBE_SEEN.store(true, Ordering::Release);
+        return std::ptr::null_mut();
+    }
+    if event_tag == PLAYBACK_EVENT_TAG {
         return event;
     }
 
@@ -1522,6 +1735,25 @@ unsafe fn tap_callback_inner(
         };
     }
 
+    if event_type == K_CG_EVENT_SCROLL_WHEEL {
+        let vertical = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
+        let horizontal = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
+        let continuous = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_IS_CONTINUOUS);
+        let momentum = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_MOMENTUM_PHASE);
+        RAW_EVENT_VALUE_1.store(vertical, Ordering::Relaxed);
+        RAW_EVENT_VALUE_2.store(horizontal, Ordering::Relaxed);
+        RAW_EVENT_KIND.store(3, Ordering::Relaxed);
+        RAW_EVENT_SERIAL.fetch_add(1, Ordering::Release);
+        let Some(key) = wheel_tilt_key(vertical, horizontal, continuous != 0, momentum != 0) else {
+            return event;
+        };
+        return if queue_binding(key) {
+            std::ptr::null_mut()
+        } else {
+            event
+        };
+    }
+
     let is_down = event_type == K_CG_EVENT_OTHER_MOUSE_DOWN;
     let is_up = event_type == K_CG_EVENT_OTHER_MOUSE_UP;
     if !is_down && !is_up {
@@ -1529,46 +1761,83 @@ unsafe fn tap_callback_inner(
     }
 
     let button = CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER);
-    LAST_BUTTON.store(button, Ordering::Relaxed);
-    if button >= 0 && record_mouse(button as u32, is_down) {
-        return std::ptr::null_mut();
-    }
-
-    let Some(key) = button_to_key(button) else {
-        return event;
-    };
-    let global_guard = match GLOBAL_BINDINGS.read() {
-        Ok(g) => g,
-        Err(_) => return event,
-    };
-    let Some(arc_bindings) = global_guard.as_ref() else {
-        return event;
-    };
-    let bindings_guard = match arc_bindings.read() {
-        Ok(b) => b,
-        Err(_) => return event,
-    };
-    let binding = bindings_guard.get(key).cloned();
-    let Some(binding) = binding else {
-        return event;
-    };
-    if !binding.enabled {
-        return event;
-    }
-
-    if is_down {
-        let actions = binding.actions.clone();
-        drop(bindings_guard);
-        drop(global_guard);
-        if let Ok(tx_guard) = PLAYBACK_TX.read() {
-            if let Some(tx) = tx_guard.as_ref() {
-                let _ = tx.send(actions);
-            }
-        }
+    RAW_EVENT_VALUE_1.store(button, Ordering::Relaxed);
+    RAW_EVENT_VALUE_2.store(0, Ordering::Relaxed);
+    RAW_EVENT_KIND.store(if is_down { 1 } else { 2 }, Ordering::Relaxed);
+    RAW_EVENT_SERIAL.fetch_add(1, Ordering::Release);
+    if button >= 0 && handle_device_button(button as u32, is_down) {
         std::ptr::null_mut()
     } else {
-        std::ptr::null_mut()
+        event
     }
+}
+
+/// 将原生鼠标事件或 HID++ MouseButtonSpy 槽位统一送入录制与回放状态机。
+/// 返回 true 表示该按键已被录制器或启用的宏绑定接管。
+pub fn handle_device_button(button: u32, is_down: bool) -> bool {
+    LAST_BUTTON.store(button as i64, Ordering::Relaxed);
+    if record_mouse(button, is_down) {
+        return true;
+    }
+
+    let Some(key) = button_to_key(button as i64) else {
+        return false;
+    };
+    if is_down {
+        queue_binding(key)
+    } else {
+        binding_enabled(key)
+    }
+}
+
+fn wheel_tilt_key(
+    vertical: i64,
+    horizontal: i64,
+    continuous: bool,
+    momentum: bool,
+) -> Option<&'static str> {
+    if vertical != 0 || horizontal == 0 || continuous || momentum {
+        return None;
+    }
+    if horizontal < 0 {
+        Some("mouse9")
+    } else {
+        Some("mouse10")
+    }
+}
+
+fn binding_enabled(key: &str) -> bool {
+    GLOBAL_BINDINGS
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().cloned())
+        .and_then(|bindings| bindings.read().ok().and_then(|b| b.get(key).cloned()))
+        .is_some_and(|binding| binding.enabled)
+}
+
+fn queue_binding(key: &str) -> bool {
+    let Ok(global_guard) = GLOBAL_BINDINGS.read() else {
+        return false;
+    };
+    let Some(arc_bindings) = global_guard.as_ref() else {
+        return false;
+    };
+    let Ok(bindings_guard) = arc_bindings.read() else {
+        return false;
+    };
+    let Some(binding) = bindings_guard.get(key).filter(|binding| binding.enabled) else {
+        return false;
+    };
+    let actions = binding.actions.clone();
+    drop(bindings_guard);
+    drop(global_guard);
+    let Ok(tx_guard) = PLAYBACK_TX.read() else {
+        return false;
+    };
+    let Some(tx) = tx_guard.as_ref() else {
+        return false;
+    };
+    tx.send((key.to_string(), actions)).is_ok()
 }
 
 // ---------------------------------------------------------------------- //
@@ -1577,6 +1846,42 @@ unsafe fn tap_callback_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_core_graphics_location_and_source_constants() {
+        assert_eq!(K_CG_HID_EVENT_TAP, 0);
+        assert_eq!(K_CG_SESSION_EVENT_TAP, 1);
+        assert_eq!(K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION_STATE, 0);
+    }
+
+    #[test]
+    fn test_tap_disabled_event_uses_unsigned_core_graphics_values() {
+        assert_eq!(K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT, 0xffff_fffe);
+        assert_eq!(K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT, 0xffff_ffff);
+        assert!(is_tap_disabled_event(0xffff_fffe));
+        assert!(is_tap_disabled_event(0xffff_ffff));
+        assert!(!is_tap_disabled_event(K_CG_EVENT_SCROLL_WHEEL as u32));
+    }
+
+    #[test]
+    fn test_modifier_events_follow_key_press_order() {
+        assert_eq!(
+            modifier_events(FLAG_CONTROL | FLAG_SHIFT),
+            vec![(FLAG_CONTROL, 59), (FLAG_SHIFT, 56)]
+        );
+        assert!(modifier_events(0).is_empty());
+    }
+
+    #[test]
+    fn test_wheel_tilt_key_filters_vertical_and_trackpad_scrolling() {
+        assert_eq!(wheel_tilt_key(0, -1, false, false), Some("mouse9"));
+        assert_eq!(wheel_tilt_key(0, 1, false, false), Some("mouse10"));
+        assert_eq!(wheel_tilt_key(1, 0, false, false), None);
+        assert_eq!(wheel_tilt_key(1, 1, false, false), None);
+        assert_eq!(wheel_tilt_key(0, 0, false, false), None);
+        assert_eq!(wheel_tilt_key(0, 1, true, false), None);
+        assert_eq!(wheel_tilt_key(0, -1, false, true), None);
+    }
 
     #[test]
     fn test_button_to_key() {
@@ -1608,6 +1913,64 @@ mod tests {
             let (flags, code) = parse_combo(combo).unwrap();
             assert_eq!(combo_name(flags, code).as_deref(), Some(combo));
         }
+    }
+
+    #[test]
+    fn test_format_recorded_keys() {
+        let shortcut = MacroBinding {
+            name: Some("录制快捷键: cmd+shift+k".into()),
+            enabled: true,
+            actions: vec![Action {
+                keys: Some("cmd+shift+k".into()),
+                ..Action::default()
+            }],
+        };
+        assert_eq!(
+            format_recorded_keys(&shortcut).as_deref(),
+            Some("cmd+shift+k")
+        );
+
+        let sequence = MacroBinding {
+            name: Some("录制按键序列: 按键序列（4 个事件）".into()),
+            enabled: true,
+            actions: vec![
+                Action {
+                    keycode: Some(8),
+                    key_down: Some(true),
+                    ..Action::default()
+                },
+                Action {
+                    keycode: Some(8),
+                    key_down: Some(false),
+                    ..Action::default()
+                },
+                Action {
+                    keycode: Some(40),
+                    key_down: Some(true),
+                    ..Action::default()
+                },
+                Action {
+                    keycode: Some(40),
+                    key_down: Some(false),
+                    ..Action::default()
+                },
+            ],
+        };
+        assert_eq!(format_recorded_keys(&sequence).as_deref(), Some("c → k"));
+        let unknown_shortcut = MacroBinding {
+            name: Some("录制快捷键: keycode 200".into()),
+            enabled: true,
+            actions: vec![Action {
+                keycode: Some(200),
+                modifiers: vec!["ctrl".into()],
+                ..Action::default()
+            }],
+        };
+        assert_eq!(
+            format_recorded_keys(&unknown_shortcut).as_deref(),
+            Some("ctrl+keycode 200")
+        );
+        assert_eq!(format_recorded_keys(&default_battery_binding()), None);
     }
 
     #[test]
@@ -1778,6 +2141,40 @@ mod tests {
             format_binding_summary(&text_binding),
             "文字: \"hello world\""
         );
+    }
+
+    #[test]
+    fn test_recorded_binding_cannot_be_saved_as_display_text() {
+        let shortcut = MacroBinding {
+            name: Some("录制快捷键: cmd+shift+k".into()),
+            enabled: true,
+            actions: vec![Action {
+                keys: Some("cmd+shift+k".into()),
+                ..Action::default()
+            }],
+        };
+        assert_eq!(
+            format_recorded_keys(&shortcut).as_deref(),
+            Some("cmd+shift+k")
+        );
+        assert!(!can_save_text_binding(false, Some(&shortcut)));
+        assert!(!can_save_text_binding(true, Some(&shortcut)));
+        assert!(!can_save_text_binding(
+            true,
+            Some(&default_battery_binding())
+        ));
+
+        let text = MacroBinding {
+            name: Some("文字: \" hello \"".into()),
+            enabled: true,
+            actions: vec![Action {
+                text: Some(" hello ".into()),
+                ..Action::default()
+            }],
+        };
+        assert!(can_save_text_binding(true, Some(&text)));
+        assert!(!can_save_text_binding(false, Some(&text)));
+        assert!(can_save_text_binding(true, None));
     }
 
     #[test]

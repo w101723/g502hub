@@ -15,9 +15,9 @@ use crate::features::battery::{read_battery, BatteryInfo};
 use crate::features::dpi::Dpi;
 use crate::features::onboard::OnboardMode;
 use crate::macro_engine::{
-    accessibility_granted, recording_outcome_pending, recording_phase, recording_serial,
-    take_recording_outcome, MacroTap, RecordingKind, RecordingOutcome, RecordingPhase,
-    RecordingResult,
+    accessibility_granted, event_posting_granted, input_monitoring_granted,
+    recording_outcome_pending, recording_phase, recording_serial, take_recording_outcome, MacroTap,
+    RecordingKind, RecordingOutcome, RecordingPhase, RecordingResult,
 };
 use anyhow::Result;
 use core_foundation_sys::date::CFAbsoluteTimeGetCurrent;
@@ -432,13 +432,16 @@ impl Core {
     }
 
     fn start_recording_for_button(&self, button: u32, kind: RecordingKind) {
+        crate::macro_engine::mlog(&format!("请求录制: mouse{button}, kind={kind:?}"));
         if !accessibility_granted(false) {
+            crate::macro_engine::mlog("录制失败: 无辅助功能权限");
             accessibility_granted(true);
             self.notify("请先在系统设置中允许 g502hub 辅助功能权限");
             return;
         }
         if !self.tap.is_running() {
             if let Err(e) = self.tap.start() {
+                crate::macro_engine::mlog(&format!("录制失败: tap 启动失败: {e}"));
                 self.notify(&format!("宏引擎启动失败: {e}"));
                 return;
             }
@@ -449,13 +452,20 @@ impl Core {
             format!("button{button}")
         };
         match self.tap.begin_recording_for_button(button, kind) {
-            Ok(()) => self.notify(&format!("正在录制 {button_name}，请按一次键盘组合键")),
-            Err(e) => self.notify(&format!("开始录制失败: {e}")),
+            Ok(()) => {
+                crate::macro_engine::mlog(&format!("录制就绪: mouse{button}"));
+                self.notify(&format!("正在录制 {button_name}，请按一次键盘组合键"));
+            }
+            Err(e) => {
+                crate::macro_engine::mlog(&format!("录制失败: {e}"));
+                self.notify(&format!("开始录制失败: {e}"));
+            }
         }
     }
 
     fn save_recording(&self, result: RecordingResult) {
         let key = format!("mouse{}", result.button);
+        crate::macro_engine::mlog(&format!("录制完成: {key}, label={}", result.label));
         let replaced = config::load()
             .ok()
             .and_then(|cfg| cfg.macros.get(&key).cloned())
@@ -475,11 +485,13 @@ impl Core {
         }) {
             Ok(macros) => macros,
             Err(e) => {
+                crate::macro_engine::mlog(&format!("录制保存失败: {key}: {e}"));
                 self.notify(&format!("保存宏失败: {e}"));
                 return;
             }
         };
         self.tap.update_bindings(macros);
+        crate::macro_engine::mlog(&format!("录制已保存并更新 tap: {key}"));
         let button = match result.button {
             3 => "G4 / mouse3".to_string(),
             4 => "G5 / mouse4".to_string(),
@@ -495,7 +507,10 @@ impl Core {
     fn handle_recording_outcome(&self, outcome: RecordingOutcome) {
         match outcome {
             RecordingOutcome::Completed(result) => self.save_recording(result),
-            RecordingOutcome::Cancelled(reason) => self.notify(&format!("录制已取消: {reason}")),
+            RecordingOutcome::Cancelled(reason) => {
+                crate::macro_engine::mlog(&format!("录制已取消: {reason}"));
+                self.notify(&format!("录制已取消: {reason}"));
+            }
         }
         if let Ok(mut st) = self.state.lock() {
             st.dirty = true;
@@ -856,11 +871,10 @@ impl Core {
                     }
                 });
             }
-            ("macro", "finish-recording") => {
-                if let Err(e) = self.tap.finish_sequence() {
-                    self.notify(&format!("结束录制失败: {e}"));
-                }
-            }
+            ("macro", "finish-recording") => match self.tap.finish_sequence() {
+                Ok(result) => self.save_recording(result),
+                Err(e) => self.notify(&format!("结束录制失败: {e}")),
+            },
             ("macro", "cancel-recording") => {
                 self.tap.cancel_recording("用户取消");
             }
@@ -920,6 +934,7 @@ impl Core {
             ("app", "quit") => {
                 if let Ok(dev) = crate::device::get_conn(0) {
                     let _ = controller::with_device_lock(|| {
+                        let _ = crate::features::mouse_button_spy::stop(&dev, true);
                         if let Ok(indicator) =
                             crate::features::indicator_led::IndicatorLed::new(&dev)
                         {
@@ -927,6 +942,8 @@ impl Core {
                         }
                         Ok(())
                     });
+                } else {
+                    crate::features::mouse_button_spy::stop_local();
                 }
                 QUIT.store(true, Ordering::Relaxed);
             }
@@ -1279,10 +1296,16 @@ pub fn run() -> Result<()> {
 
     if cfg.macros.values().any(|m| m.enabled) {
         let granted = accessibility_granted(false);
+        let input_granted = input_monitoring_granted(false);
+        let posting_granted = event_posting_granted();
         crate::macro_engine::mlog(&format!(
-            "menubar 启动:有启用宏,accessibility_granted={granted},尝试启动 tap"
+            "menubar 启动:有启用宏,accessibility={granted},input_monitoring={input_granted},event_posting={posting_granted}"
         ));
         if granted {
+            if !input_granted {
+                input_monitoring_granted(true);
+                crate::macro_engine::mlog("menubar 启动:已请求输入监控权限");
+            }
             if let Err(e) = tap.start() {
                 crate::macro_engine::mlog(&format!("menubar 启动:tap 启动失败: {e}"));
             }
@@ -1387,6 +1410,11 @@ pub fn run() -> Result<()> {
 
     // 初始化控制中心浮窗
     crate::panel::PopoverPanel::init(mtm);
+
+    // 调试辅助: G502HUB_AUTO_SHOW=1 时启动即打开控制中心 (用于自动化截图验证)
+    if std::env::var("G502HUB_AUTO_SHOW").is_ok() {
+        crate::panel::PopoverPanel::request_show();
+    }
 
     let poll_state = state.clone();
     let poll_led_sync = led_sync_pending.clone();
