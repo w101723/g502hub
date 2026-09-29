@@ -896,13 +896,23 @@ pub fn get_binding_text(binding: &MacroBinding) -> Option<String> {
 }
 
 pub fn save_text_binding(button_key: &str, text: &str) -> Result<()> {
-    // 仅用 trim 判空与生成展示名;实际存储/回放必须保留前后空格。
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return clear_binding(button_key);
+    let key_id = if let Some(gk) = get_gkey_by_id(button_key) {
+        gk.id
+    } else {
+        button_key
+    };
+    if text.is_empty() {
+        return clear_binding(key_id);
     }
+    // 忠实保留用户输入的前后及所有空格，包含纯空格宏（如输入空格键或缩进）
+    let display_text = if text.chars().count() > 24 {
+        let truncated: String = text.chars().take(24).collect();
+        format!("{truncated}...")
+    } else {
+        text.to_string()
+    };
     let binding = MacroBinding {
-        name: Some(format!("文字: \"{trimmed}\"")),
+        name: Some(format!("文字: \"{display_text}\"")),
         enabled: true,
         actions: vec![Action {
             text: Some(text.to_string()),
@@ -910,7 +920,7 @@ pub fn save_text_binding(button_key: &str, text: &str) -> Result<()> {
         }],
     };
     let macros = crate::config::update(|cfg| {
-        cfg.macros.insert(button_key.to_string(), binding);
+        cfg.macros.insert(key_id.to_string(), binding);
         cfg.macros.clone()
     })?;
     if let Some(tap) = global_tap() {
@@ -920,9 +930,14 @@ pub fn save_text_binding(button_key: &str, text: &str) -> Result<()> {
 }
 
 pub fn save_battery_binding(button_key: &str) -> Result<()> {
+    let key_id = if let Some(gk) = get_gkey_by_id(button_key) {
+        gk.id
+    } else {
+        button_key
+    };
     let binding = default_battery_binding();
     let macros = crate::config::update(|cfg| {
-        cfg.macros.insert(button_key.to_string(), binding);
+        cfg.macros.insert(key_id.to_string(), binding);
         cfg.macros.clone()
     })?;
     if let Some(tap) = global_tap() {
@@ -932,8 +947,13 @@ pub fn save_battery_binding(button_key: &str) -> Result<()> {
 }
 
 pub fn clear_binding(button_key: &str) -> Result<()> {
+    let key_id = if let Some(gk) = get_gkey_by_id(button_key) {
+        gk.id
+    } else {
+        button_key
+    };
     let macros = crate::config::update(|cfg| {
-        cfg.macros.remove(button_key);
+        cfg.macros.remove(key_id);
         cfg.macros.clone()
     })?;
     if let Some(tap) = global_tap() {
@@ -2165,6 +2185,39 @@ mod tests {
         );
     }
 
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_save_text_binding_preserves_spaces_and_whitespace_only() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let temp_dir =
+            std::env::temp_dir().join(format!("g502hub_test_spaces_{}", std::process::id()));
+        let orig_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_dir);
+
+        // 1. 带有首尾空格的字符串必须完整保留
+        save_text_binding("mouse4", "  ls -la  ").expect("save text with spaces");
+        let b = get_binding_for_key("mouse4").expect("found mouse4");
+        assert_eq!(get_binding_text(&b), Some("  ls -la  ".to_string()));
+        assert_eq!(format_binding_summary(&b), "文字: \"  ls -la  \"");
+
+        // 2. 纯空格字符串必须保留且不被当作空清除
+        save_text_binding("mouse5", "   ").expect("save whitespace only text");
+        let b2 = get_binding_for_key("mouse5").expect("found mouse5");
+        assert_eq!(get_binding_text(&b2), Some("   ".to_string()));
+        assert_eq!(format_binding_summary(&b2), "文字: \"   \"");
+
+        // 3. 真正空字符串则清除绑定
+        save_text_binding("mouse4", "").expect("save empty text clears");
+        assert_eq!(get_binding_for_key("mouse4"), None);
+
+        // 清理测试临时环境
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        if let Some(h) = orig_home {
+            std::env::set_var("HOME", h);
+        }
+    }
+
     #[test]
     fn test_recorded_binding_cannot_be_saved_as_display_text() {
         let shortcut = MacroBinding {
@@ -2258,6 +2311,7 @@ mod tests {
 
     #[test]
     fn test_clear_and_reset_battery_binding() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let temp_dir = std::env::temp_dir().join(format!("g502hub_test_{}", std::process::id()));
         let orig_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_dir);

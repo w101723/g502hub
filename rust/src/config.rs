@@ -189,6 +189,24 @@ impl Config {
                 } else if action.device_action == Some(DeviceAction::BatteryLevel) {
                     had_battery = true;
                 }
+                // 修复旧版本中被 trim 截断空格的文字宏展示名称
+                if let Some(text) = &action.text {
+                    let display_text = if text.chars().count() > 24 {
+                        let truncated: String = text.chars().take(24).collect();
+                        format!("{truncated}...")
+                    } else {
+                        text.to_string()
+                    };
+                    let expected_name = format!("文字: \"{display_text}\"");
+                    if binding
+                        .name
+                        .as_ref()
+                        .is_some_and(|n| n.starts_with("文字: ") && n != &expected_name)
+                    {
+                        binding.name = Some(expected_name);
+                        modified = true;
+                    }
+                }
             }
             if had_battery && binding.name.as_deref() == Some("⚡️ 电池电量") {
                 binding.name = Some("设备动作 · 电池电量".into());
@@ -531,6 +549,26 @@ mod tests {
             Some(DeviceAction::BatteryLevel)
         );
         assert_eq!(m8.actions[0].keys, None);
+    }
+
+    #[test]
+    fn test_migrate_trimmed_text_macro_name() {
+        let legacy_json = r#"{
+            "macros": {
+                "mouse4": {
+                    "name": "文字: \"ps aux | grep\"",
+                    "enabled": true,
+                    "actions": [
+                        {"text": "ps aux | grep  "}
+                    ]
+                }
+            }
+        }"#;
+        let mut cfg: Config = serde_json::from_str(legacy_json).unwrap();
+        assert!(cfg.migrate_legacy());
+        let m4 = cfg.macros.get("mouse4").unwrap();
+        assert_eq!(m4.name.as_deref(), Some("文字: \"ps aux | grep  \""));
+        assert_eq!(m4.actions[0].text.as_deref(), Some("ps aux | grep  "));
     }
 
     #[test]

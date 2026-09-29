@@ -1123,7 +1123,11 @@ declare_class!(
                         return;
                     }
                     PopoverPanel::select_gkey(gk.id, false);
-                    let text = unsafe { tf.stringValue() }.to_string();
+                    let text = if let Some(editor) = PopoverPanel::active_editor(tf) {
+                        unsafe { editor.string() }.to_string()
+                    } else {
+                        unsafe { tf.stringValue() }.to_string()
+                    };
                     if let Err(e) = crate::macro_engine::save_text_binding(gk.id, &text) {
                         eprintln!("保存 {} 文字宏失败: {e}", gk.id);
                     }
@@ -3369,8 +3373,7 @@ impl PopoverPanel {
                         } else {
                             unsafe { row.text_input.stringValue() }.to_string()
                         };
-                        let trimmed = text.trim();
-                        if trimmed.is_empty() {
+                        if text.is_empty() {
                             let _ = crate::macro_engine::clear_binding(row.key_id);
                             unsafe {
                                 row.summary_label
@@ -3380,7 +3383,7 @@ impl PopoverPanel {
                                 row.clear_btn.setEnabled(false);
                             }
                         } else {
-                            // 保存原始文本, 保留用户输入的前后空格
+                            // 保存原始文本, 保留用户输入的前后及所有空格
                             let _ = crate::macro_engine::save_text_binding(row.key_id, &text);
                             unsafe {
                                 row.summary_label
@@ -3415,8 +3418,10 @@ impl PopoverPanel {
                         continue;
                     };
                     let text = unsafe { editor.string() }.to_string();
-                    if !text.trim().is_empty() {
+                    if !text.is_empty() {
                         let _ = crate::macro_engine::save_text_binding(row.key_id, &text);
+                    } else {
+                        let _ = crate::macro_engine::clear_binding(row.key_id);
                     }
                 }
             }
