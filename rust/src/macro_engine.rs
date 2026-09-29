@@ -407,6 +407,19 @@ unsafe fn post_tap_probe() -> Result<()> {
     Ok(())
 }
 
+unsafe fn warmup_event_pipeline() {
+    let source = CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION_STATE);
+    let event = CGEventCreateKeyboardEvent(source, u16::MAX, true);
+    if !event.is_null() {
+        CGEventSetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA, PLAYBACK_EVENT_TAG);
+        CGEventPost(K_CG_SESSION_EVENT_TAP, event);
+        CFRelease(event);
+    }
+    if !source.is_null() {
+        CFRelease(source);
+    }
+}
+
 unsafe fn post_keyboard_event(code: u16, down: bool, flags: u64) -> Result<()> {
     let source = CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_COMBINED_SESSION_STATE);
     let event = CGEventCreateKeyboardEvent(source, code, down);
@@ -432,34 +445,34 @@ fn tap_key(spec: &str) -> Result<()> {
     let (flags, keycode) = parse_combo(spec)?;
     let modifiers = modifier_events(flags);
 
-    // 依照罗技 G HUB 硬件模拟规范时序(每步保持 30~50ms 真实物理等待):
-    // 1. 依次按下修饰键，带上累积修饰键掩码
+    // 极速电竞级毫秒响应时序: 消除组合键操作延迟感 (总耗时约 10~15ms, 比旧逻辑快 10 倍以上)
+    // 1. 依次按下修饰键，带上累积修饰键掩码 (微秒级保序)
     let mut active = 0;
     for &(flag, code) in &modifiers {
         active |= flag;
         unsafe { post_keyboard_event(code, true, active)? };
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 
-    // 2. 按下目标主键(带完整组合键掩码)
+    // 2. 立即按下目标主键(带完整组合键掩码)
     unsafe {
         post_keyboard_event(keycode, true, flags)?;
     }
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // 保持按压 6ms 确保系统与应用事件总线完整捕获采样
+    std::thread::sleep(std::time::Duration::from_millis(6));
 
     // 3. 释放目标主键
     unsafe {
         post_keyboard_event(keycode, false, flags)?;
     }
-    std::thread::sleep(std::time::Duration::from_millis(30));
+    std::thread::sleep(std::time::Duration::from_millis(2));
 
     // 4. 逆序释放修饰键
     for &(flag, code) in modifiers.iter().rev() {
         active &= !flag;
         unsafe { post_keyboard_event(code, false, active)? };
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    std::thread::sleep(std::time::Duration::from_millis(20));
 
     Ok(())
 }
@@ -600,7 +613,7 @@ pub fn play(actions: &[Action]) -> Result<()> {
                     post_keyboard_event(kc as u16, keydown, flags)?;
                 }
                 if idx + 1 < states.len() {
-                    std::thread::sleep(std::time::Duration::from_millis(40));
+                    std::thread::sleep(std::time::Duration::from_millis(6));
                 }
             }
         }
@@ -1364,7 +1377,10 @@ impl MacroTap {
                 drop(th);
 
                 TAP_PROBE_SEEN.store(false, Ordering::Release);
-                unsafe { post_tap_probe()? };
+                unsafe {
+                    post_tap_probe()?;
+                    warmup_event_pipeline();
+                };
                 for _ in 0..20 {
                     if TAP_PROBE_SEEN.load(Ordering::Acquire) {
                         let enabled_keys = self
@@ -1855,13 +1871,13 @@ fn queue_binding(key: &str) -> bool {
     drop(bindings_guard);
     drop(global_guard);
 
-    // 跨监听通道 (HID++ MouseButtonSpy 与系统 CGEventTap) 快速重复触发去重防抖 (120ms 窗口)
+    // 跨监听通道 (HID++ MouseButtonSpy 与系统 CGEventTap) 快速重复触发去重防抖 (40ms 窗口，消除双通道并行重复且支持高速连击)
     let now = std::time::Instant::now();
     if let Ok(mut last_map_guard) = LAST_TRIGGER.lock() {
         let map = last_map_guard.get_or_insert_with(std::collections::HashMap::new);
         if let Some(last_time) = map.get(key) {
             let elapsed = now.duration_since(*last_time);
-            if elapsed < std::time::Duration::from_millis(120) {
+            if elapsed < std::time::Duration::from_millis(40) {
                 mlog(&format!(
                     "去重防抖: 忽略 {key} 快速重复触发 (距上次仅 {}ms, 来自并行监听通道)",
                     elapsed.as_millis()
@@ -2182,6 +2198,24 @@ mod tests {
         assert_eq!(
             format_binding_summary(&text_binding),
             "文字: \"hello world\""
+        );
+    }
+
+    #[test]
+    fn test_tap_key_latency_fast() {
+        // 先进行一次通道预热以完成 CoreGraphics 与 WindowServer 首次 IPC 通道建联
+        unsafe {
+            warmup_event_pipeline();
+        }
+
+        let t0 = Instant::now();
+        let _ = tap_key("ctrl+left");
+        let elapsed = t0.elapsed();
+        // 极速电竞时序必须在 35ms 内完成全套按压与释放 (远低于旧版 150ms 导致明显迟滞)
+        assert!(
+            elapsed < Duration::from_millis(35),
+            "tap_key 耗时过长: {}ms (应 < 35ms)",
+            elapsed.as_millis()
         );
     }
 
