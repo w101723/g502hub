@@ -15,7 +15,7 @@ use objc2::rc::{Allocated, Retained};
 use objc2::runtime::NSObject;
 use objc2::{declare_class, msg_send, msg_send_id, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSApplication,
+    NSAppearance, NSAppearanceCustomization, NSAppearanceNameDarkAqua, NSApplication,
     NSBackingStoreType, NSBezierPath, NSBox, NSBoxType, NSButton, NSButtonType,
     NSCellImagePosition, NSColor, NSCompositingOperation, NSControl, NSCursor, NSEvent,
     NSFloatingWindowLevel, NSFont, NSFontAttributeName, NSFontWeightBold, NSFontWeightMedium,
@@ -76,6 +76,18 @@ unsafe fn draw_text_right(text: &str, right_x: f64, y: f64, font: &NSFont, color
     let size: NSSize = msg_send![&*s, sizeWithAttributes: &*dict];
     let rect = NSRect::new(
         NSPoint::new(right_x - size.width, y),
+        NSSize::new(size.width + 2.0, size.height),
+    );
+    let _: () = msg_send![&*s, drawInRect: rect, withAttributes: &*dict];
+}
+
+/// 在指定中心坐标 (cx, cy) 处精准居中绘制文本
+unsafe fn draw_text_at_center(text: &str, cx: f64, cy: f64, font: &NSFont, color: &NSColor) {
+    let s = NSString::from_str(text);
+    let dict = make_text_attrs(font, color);
+    let size: NSSize = msg_send![&*s, sizeWithAttributes: &*dict];
+    let rect = NSRect::new(
+        NSPoint::new(cx - size.width * 0.5, cy - size.height * 0.5),
         NSSize::new(size.width + 2.0, size.height),
     );
     let _: () = msg_send![&*s, drawInRect: rect, withAttributes: &*dict];
@@ -298,14 +310,26 @@ declare_class!(
             unsafe {
                 if sel {
                     let path =
-                        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bounds, 7.0, 7.0);
-                    PopoverPanel::color_accent().setFill();
+                        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bounds, 8.0, 8.0);
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.047, 0.169, 0.231, 0.95).setFill();
                     path.fill();
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.808, 1.0, 0.65).setStroke();
+                    path.setLineWidth(1.0);
+                    path.stroke();
+
+                    // 左侧罗技青活力指示条 (强化选中感)
+                    let bar_rect = NSRect::new(NSPoint::new(3.5, 9.0), NSSize::new(3.5, h - 18.0));
+                    let bar = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bar_rect, 1.75, 1.75);
+                    PopoverPanel::color_accent().setFill();
+                    bar.fill();
                 } else if hov {
                     let path =
-                        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bounds, 7.0, 7.0);
-                    NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 0.06).setFill();
+                        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bounds, 8.0, 8.0);
+                    NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.05).setFill();
                     path.fill();
+                    NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.08).setStroke();
+                    path.setLineWidth(1.0);
+                    path.stroke();
                 }
 
                 let icon = if sel {
@@ -316,20 +340,22 @@ declare_class!(
                 let icon_size = icon.size();
                 if icon_size.width > 0.5 {
                     let icon_rect = NSRect::new(
-                        NSPoint::new(11.0, (h - icon_size.height) * 0.5),
+                        NSPoint::new(12.0, (h - icon_size.height) * 0.5),
                         NSSize::new(icon_size.width, icon_size.height),
                     );
                     icon.drawInRect(icon_rect);
                 }
 
-                let font = NSFont::systemFontOfSize_weight(13.0, NSFontWeightMedium);
+                let font = NSFont::systemFontOfSize_weight(13.5, NSFontWeightMedium);
                 let color = if sel {
-                    NSColor::whiteColor()
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.96, 0.98, 1.0, 1.0)
+                } else if hov {
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.88, 0.92, 0.96, 1.0)
                 } else {
                     PopoverPanel::color_primary_text()
                 };
                 let title = self.ivars().title.borrow().clone();
-                draw_text_left(&title, 37.0, (h - 16.0) * 0.5, &font, &color);
+                draw_text_left(&title, 38.0, (h - 16.0) * 0.5, &font, &color);
             }
         }
 
@@ -501,18 +527,20 @@ declare_class!(
             unsafe {
                 let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bounds, 10.0, 10.0);
                 if sel {
-                    PopoverPanel::color_accent().setFill();
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.04, 0.28, 0.40, 0.90).setFill();
                 } else if hov {
-                    NSColor::colorWithSRGBRed_green_blue_alpha(0.906, 0.906, 0.918, 1.0).setFill();
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.18, 0.20, 0.24, 1.0).setFill();
                 } else {
-                    NSColor::colorWithSRGBRed_green_blue_alpha(0.949, 0.949, 0.961, 1.0).setFill();
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.10, 0.11, 0.13, 1.0).setFill();
                 }
                 path.fill();
 
                 let border = if sel {
                     PopoverPanel::color_accent()
+                } else if hov {
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.30, 0.33, 0.38, 1.0)
                 } else {
-                    NSColor::colorWithSRGBRed_green_blue_alpha(0.886, 0.886, 0.910, 1.0)
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.18, 0.20, 0.23, 1.0)
                 };
                 border.setStroke();
                 path.setLineWidth(if sel { 1.5 } else { 1.0 });
@@ -520,7 +548,7 @@ declare_class!(
 
                 let value_font = NSFont::monospacedDigitSystemFontOfSize_weight(14.5, NSFontWeightBold);
                 let value_color = if sel {
-                    NSColor::whiteColor()
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.92, 0.98, 1.0, 1.0)
                 } else {
                     PopoverPanel::color_primary_text()
                 };
@@ -529,7 +557,7 @@ declare_class!(
 
                 let sub_font = NSFont::systemFontOfSize(10.5);
                 let sub_color = if sel {
-                    NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.85)
+                    PopoverPanel::color_accent()
                 } else {
                     PopoverPanel::color_secondary_text()
                 };
@@ -608,6 +636,7 @@ pub struct LedPreviewIvars {
     brightness: Cell<u8>,
     period_ms: Cell<u16>,
     zone_idx: Cell<usize>,
+    tracking_area: RefCell<Option<Retained<NSTrackingArea>>>,
 }
 
 declare_class!(
@@ -632,8 +661,57 @@ declare_class!(
                 brightness: Cell::new(100),
                 period_ms: Cell::new(2000),
                 zone_idx: Cell::new(0),
+                tracking_area: RefCell::new(None),
             });
             unsafe { msg_send_id![super(this), initWithFrame: frame] }
+        }
+
+        #[method(updateTrackingAreas)]
+        fn update_tracking_areas(&self) {
+            let ivars = self.ivars();
+            if let Some(old_area) = ivars.tracking_area.borrow_mut().take() {
+                unsafe { self.removeTrackingArea(&old_area) };
+            }
+            let bounds = self.bounds();
+            let opts = NSTrackingAreaOptions::NSTrackingMouseEnteredAndExited
+                | NSTrackingAreaOptions::NSTrackingActiveAlways
+                | NSTrackingAreaOptions::NSTrackingInVisibleRect;
+            let alloc = NSTrackingArea::alloc();
+            let area = unsafe {
+                NSTrackingArea::initWithRect_options_owner_userInfo(
+                    alloc,
+                    bounds,
+                    opts,
+                    Some(self.as_ref()),
+                    None,
+                )
+            };
+            unsafe { self.addTrackingArea(&area) };
+            *ivars.tracking_area.borrow_mut() = Some(area);
+        }
+
+        #[method(mouseEntered:)]
+        fn mouse_entered(&self, _event: &NSEvent) {
+            unsafe { NSCursor::pointingHandCursor().set() };
+        }
+
+        #[method(mouseExited:)]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            unsafe { NSCursor::arrowCursor().set() };
+        }
+
+        #[method(mouseDown:)]
+        fn mouse_down(&self, event: &NSEvent) {
+            let win_pt = unsafe { event.locationInWindow() };
+            let local_pt = self.convertPoint_fromView(win_pt, None);
+            let w = self.bounds().size.width;
+            let current = self.ivars().zone_idx.get();
+            let clicked_zone = if local_pt.x < w * 0.5 { 1 } else { 2 };
+            if current == clicked_zone {
+                PopoverPanel::dispatch_zone(0);
+            } else {
+                PopoverPanel::dispatch_zone(clicked_zone);
+            }
         }
 
         #[method(drawRect:)]
@@ -652,180 +730,215 @@ declare_class!(
             unsafe {
                 let ctx = NSGraphicsContext::currentContext();
 
-                // 1. 深色机身底板 (上浅下深渐层 + 细高光边框)
-                let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bounds, 10.0, 10.0);
+                // 整体外框剪裁 (防溢出)
+                let outer_path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bounds, 10.0, 10.0);
                 if let Some(ctx) = ctx.as_ref() {
                     ctx.saveGraphicsState();
-                    path.addClip();
-                    let top = NSColor::colorWithSRGBRed_green_blue_alpha(0.153, 0.153, 0.173, 1.0);
-                    top.setFill();
-                    NSBezierPath::bezierPathWithRect(NSRect::new(
-                        NSPoint::new(0.0, h * 0.55),
-                        NSSize::new(w, h * 0.45),
-                    ))
-                    .fill();
-                    let bottom = NSColor::colorWithSRGBRed_green_blue_alpha(0.075, 0.075, 0.086, 1.0);
-                    bottom.setFill();
-                    NSBezierPath::bezierPathWithRect(NSRect::new(
-                        NSPoint::new(0.0, 0.0),
-                        NSSize::new(w, h * 0.55),
-                    ))
-                    .fill();
-                    ctx.restoreGraphicsState();
-                }
-                let rim = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.10);
-                rim.setStroke();
-                path.setLineWidth(1.0);
-                path.stroke();
+                    outer_path.addClip();
 
-                let strip_alpha = if zone == 2 { 0.15 } else { 1.0 };
-                let logo_alpha = if zone == 1 { 0.15 } else { 1.0 };
+                    // 背景底色
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.063, 0.067, 0.078, 1.0).setFill();
+                    outer_path.fill();
 
-                // 2. 主要灯带 (横向胶囊光条)
-                let sh = 8.0;
-                let sw = w * 0.40;
-                let sx = w * 0.06;
-                let sy = (h - sh) * 0.5;
-                if mode == 0 {
-                    let dim = NSColor::colorWithSRGBRed_green_blue_alpha(0.235, 0.235, 0.255, strip_alpha);
-                    dim.setFill();
-                    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-                        NSRect::new(NSPoint::new(sx, sy), NSSize::new(sw, sh)),
-                        4.0,
-                        4.0,
-                    )
-                    .fill();
-                } else if mode == 2 {
-                    // 彩色循环: 24 段彩虹切片
-                    if let Some(ctx) = ctx.as_ref() {
-                        ctx.saveGraphicsState();
-                        let clip = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-                            NSRect::new(NSPoint::new(sx, sy), NSSize::new(sw, sh)),
-                            4.0,
-                            4.0,
-                        );
-                        clip.addClip();
-                        let slices = 24usize;
-                        for i in 0..slices {
-                            let hue = i as f64 * 360.0 / slices as f64;
+                    let card_gap = 12.0;
+                    let pad_x = 10.0;
+                    let pad_y = 8.0;
+                    let card_w = (w - pad_x * 2.0 - card_gap) * 0.5;
+                    let card_h = h - pad_y * 2.0;
+
+                    let r_norm = rgb[0] as f64 / 255.0;
+                    let g_norm = rgb[1] as f64 / 255.0;
+                    let b_norm = rgb[2] as f64 / 255.0;
+                    let breath_dim = if mode == 3 { 0.65 } else { 1.0 };
+
+                    // ========================================== //
+                    // 分区 1: 主要灯带 (左子卡片)
+                    // ========================================== //
+                    let left_active = zone == 0 || zone == 1;
+                    let left_rect = NSRect::new(NSPoint::new(pad_x, pad_y), NSSize::new(card_w, card_h));
+                    let left_path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(left_rect, 8.0, 8.0);
+
+                    if left_active {
+                        NSColor::colorWithSRGBRed_green_blue_alpha(0.045, 0.160, 0.220, 0.95).setFill();
+                        left_path.fill();
+                        NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.808, 1.0, 0.85).setStroke();
+                        left_path.setLineWidth(1.5);
+                        left_path.stroke();
+                    } else {
+                        NSColor::colorWithSRGBRed_green_blue_alpha(0.082, 0.086, 0.102, 0.95).setFill();
+                        left_path.fill();
+                        NSColor::colorWithSRGBRed_green_blue_alpha(0.18, 0.20, 0.24, 0.80).setStroke();
+                        left_path.setLineWidth(1.0);
+                        left_path.stroke();
+                    }
+
+                    // 标题与标签
+                    let title_font = NSFont::boldSystemFontOfSize(12.5);
+                    let tag_font = NSFont::monospacedDigitSystemFontOfSize_weight(10.5, NSFontWeightMedium);
+                    let title_color = if left_active {
+                        NSColor::colorWithSRGBRed_green_blue_alpha(0.95, 0.97, 1.0, 1.0)
+                    } else {
+                        NSColor::colorWithSRGBRed_green_blue_alpha(0.55, 0.58, 0.65, 1.0)
+                    };
+                    let tag_color = if left_active {
+                        PopoverPanel::color_accent()
+                    } else {
+                        NSColor::colorWithSRGBRed_green_blue_alpha(0.42, 0.45, 0.52, 1.0)
+                    };
+                    draw_text_left("主要灯带", pad_x + 12.0, pad_y + card_h - 22.0, &title_font, &title_color);
+                    let left_tag = if zone == 0 {
+                        "全部同步"
+                    } else if left_active {
+                        "正在配置"
+                    } else {
+                        "未选中"
+                    };
+                    draw_text_right(left_tag, pad_x + card_w - 12.0, pad_y + card_h - 22.0, &tag_font, &tag_color);
+
+                    // 主要灯带 3 段式光条模拟
+                    let strip_alpha = if left_active { 1.0 } else { 0.18 };
+                    let bars_cx = pad_x + card_w * 0.5;
+                    let bars_cy = pad_y + card_h * 0.38;
+                    let bar_w = 26.0;
+                    let bar_h = 7.0;
+                    let bar_spacing = 4.0;
+                    let total_bars_w = bar_w * 3.0 + bar_spacing * 2.0;
+                    let start_bx = bars_cx - total_bars_w * 0.5;
+
+                    for b in 0..3 {
+                        let bx = start_bx + b as f64 * (bar_w + bar_spacing);
+                        let by = bars_cy - bar_h * 0.5;
+                        let bar_rect = NSRect::new(NSPoint::new(bx, by), NSSize::new(bar_w, bar_h));
+                        let bar_path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bar_rect, 3.5, 3.5);
+
+                        if mode == 0 {
+                            NSColor::colorWithSRGBRed_green_blue_alpha(0.20, 0.22, 0.26, strip_alpha).setFill();
+                            bar_path.fill();
+                        } else if mode == 2 {
+                            let hue = (b as f64 * 45.0 + 120.0) % 360.0;
                             let c = hsv_to_rgb(hue, 1.0, 1.0);
                             let col = NSColor::colorWithSRGBRed_green_blue_alpha(
                                 c[0] as f64 / 255.0,
                                 c[1] as f64 / 255.0,
                                 c[2] as f64 / 255.0,
-                                strip_alpha * (0.45 + bright * 0.55),
+                                strip_alpha * (0.60 + bright * 0.40),
                             );
                             col.setFill();
-                            let slice_x = sx + i as f64 * sw / slices as f64;
-                            NSBezierPath::bezierPathWithRect(NSRect::new(
-                                NSPoint::new(slice_x, sy),
-                                NSSize::new(sw / slices as f64 + 0.6, sh),
-                            ))
-                            .fill();
+                            bar_path.fill();
+                        } else {
+                            if left_active {
+                                let glow_c = NSColor::colorWithSRGBRed_green_blue_alpha(
+                                    r_norm, g_norm, b_norm, 0.25 * bright * breath_dim * strip_alpha,
+                                );
+                                glow_c.setFill();
+                                let expand_rect = NSRect::new(
+                                    NSPoint::new(bx - 4.0, by - 4.0),
+                                    NSSize::new(bar_w + 8.0, bar_h + 8.0),
+                                );
+                                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(expand_rect, 5.5, 5.5).fill();
+                            }
+                            let core = NSColor::colorWithSRGBRed_green_blue_alpha(
+                                r_norm, g_norm, b_norm, strip_alpha * (0.55 + 0.45 * bright) * breath_dim,
+                            );
+                            core.setFill();
+                            bar_path.fill();
                         }
-                        ctx.restoreGraphicsState();
                     }
-                } else {
-                    // 固定色 / 呼吸: 三层柔光 + 核心光条
-                    let breath_dim = if mode == 3 { 0.62 } else { 1.0 };
-                    for (expand, factor) in [(14.0, 0.05), (9.0, 0.09), (4.5, 0.16)] {
-                        let glow_c = NSColor::colorWithSRGBRed_green_blue_alpha(
-                            rgb[0] as f64 / 255.0,
-                            rgb[1] as f64 / 255.0,
-                            rgb[2] as f64 / 255.0,
-                            factor * bright * breath_dim * strip_alpha,
-                        );
-                        glow_c.setFill();
-                        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-                            NSRect::new(
-                                NSPoint::new(sx - expand, sy - expand),
-                                NSSize::new(sw + expand * 2.0, sh + expand * 2.0),
-                            ),
-                            (sh + expand * 2.0) * 0.5,
-                            (sh + expand * 2.0) * 0.5,
-                        )
-                        .fill();
-                    }
-                    let core = NSColor::colorWithSRGBRed_green_blue_alpha(
-                        rgb[0] as f64 / 255.0,
-                        rgb[1] as f64 / 255.0,
-                        rgb[2] as f64 / 255.0,
-                        strip_alpha * (0.55 + 0.45 * bright) * breath_dim,
-                    );
-                    core.setFill();
-                    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-                        NSRect::new(NSPoint::new(sx, sy), NSSize::new(sw, sh)),
-                        4.0,
-                        4.0,
-                    )
-                    .fill();
-                }
 
-                // 3. G 标志发光圆
-                let r = (h * 0.5 - 12.0).clamp(12.0, 20.0);
-                let cx = w * 0.78;
-                let cy = h * 0.5;
-                if mode == 0 {
-                    let dim = NSColor::colorWithSRGBRed_green_blue_alpha(0.235, 0.235, 0.255, logo_alpha);
-                    dim.setFill();
-                    NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-                        NSPoint::new(cx - r, cy - r),
-                        NSSize::new(r * 2.0, r * 2.0),
-                    ))
-                    .fill();
-                } else {
-                    let breath_dim = if mode == 3 { 0.62 } else { 1.0 };
-                    for (expand, factor) in [(12.0, 0.06), (7.0, 0.11), (3.0, 0.18)] {
-                        let glow_c = NSColor::colorWithSRGBRed_green_blue_alpha(
-                            rgb[0] as f64 / 255.0,
-                            rgb[1] as f64 / 255.0,
-                            rgb[2] as f64 / 255.0,
-                            factor * bright * breath_dim * logo_alpha,
-                        );
-                        glow_c.setFill();
-                        let er = r + expand;
+                    // ========================================== //
+                    // 分区 2: G 标志 (右子卡片)
+                    // ========================================== //
+                    let right_active = zone == 0 || zone == 2;
+                    let right_x = pad_x + card_w + card_gap;
+                    let right_rect = NSRect::new(NSPoint::new(right_x, pad_y), NSSize::new(card_w, card_h));
+                    let right_path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(right_rect, 8.0, 8.0);
+
+                    if right_active {
+                        NSColor::colorWithSRGBRed_green_blue_alpha(0.045, 0.160, 0.220, 0.95).setFill();
+                        right_path.fill();
+                        NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.808, 1.0, 0.85).setStroke();
+                        right_path.setLineWidth(1.5);
+                        right_path.stroke();
+                    } else {
+                        NSColor::colorWithSRGBRed_green_blue_alpha(0.082, 0.086, 0.102, 0.95).setFill();
+                        right_path.fill();
+                        NSColor::colorWithSRGBRed_green_blue_alpha(0.18, 0.20, 0.24, 0.80).setStroke();
+                        right_path.setLineWidth(1.0);
+                        right_path.stroke();
+                    }
+
+                    // 标题与标签
+                    let title_color_r = if right_active {
+                        NSColor::colorWithSRGBRed_green_blue_alpha(0.95, 0.97, 1.0, 1.0)
+                    } else {
+                        NSColor::colorWithSRGBRed_green_blue_alpha(0.55, 0.58, 0.65, 1.0)
+                    };
+                    let tag_color_r = if right_active {
+                        PopoverPanel::color_accent()
+                    } else {
+                        NSColor::colorWithSRGBRed_green_blue_alpha(0.42, 0.45, 0.52, 1.0)
+                    };
+                    draw_text_left("G 标志", right_x + 12.0, pad_y + card_h - 22.0, &title_font, &title_color_r);
+                    let right_tag = if zone == 0 {
+                        "全部同步"
+                    } else if right_active {
+                        "正在配置"
+                    } else {
+                        "未选中"
+                    };
+                    draw_text_right(right_tag, right_x + card_w - 12.0, pad_y + card_h - 22.0, &tag_font, &tag_color_r);
+
+                    // G 标发光光圈与文字模拟
+                    let logo_alpha = if right_active { 1.0 } else { 0.18 };
+                    let logo_cx = right_x + card_w * 0.5;
+                    let logo_cy = pad_y + card_h * 0.38;
+                    let r = 16.0;
+
+                    if mode == 0 {
+                        let dim = NSColor::colorWithSRGBRed_green_blue_alpha(0.20, 0.22, 0.26, logo_alpha);
+                        dim.setFill();
                         NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-                            NSPoint::new(cx - er, cy - er),
-                            NSSize::new(er * 2.0, er * 2.0),
+                            NSPoint::new(logo_cx - r, logo_cy - r),
+                            NSSize::new(r * 2.0, r * 2.0),
+                        ))
+                        .fill();
+                    } else {
+                        if right_active {
+                            for (expand, factor) in [(10.0, 0.08), (5.0, 0.16)] {
+                                let glow_c = NSColor::colorWithSRGBRed_green_blue_alpha(
+                                    r_norm, g_norm, b_norm, factor * bright * breath_dim * logo_alpha,
+                                );
+                                glow_c.setFill();
+                                let er = r + expand;
+                                NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+                                    NSPoint::new(logo_cx - er, logo_cy - er),
+                                    NSSize::new(er * 2.0, er * 2.0),
+                                ))
+                                .fill();
+                            }
+                        }
+                        let core = NSColor::colorWithSRGBRed_green_blue_alpha(
+                            r_norm, g_norm, b_norm, logo_alpha * (0.55 + 0.45 * bright) * breath_dim,
+                        );
+                        core.setFill();
+                        NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+                            NSPoint::new(logo_cx - r, logo_cy - r),
+                            NSSize::new(r * 2.0, r * 2.0),
                         ))
                         .fill();
                     }
-                    let core = NSColor::colorWithSRGBRed_green_blue_alpha(
-                        rgb[0] as f64 / 255.0,
-                        rgb[1] as f64 / 255.0,
-                        rgb[2] as f64 / 255.0,
-                        logo_alpha * (0.55 + 0.45 * bright) * breath_dim,
-                    );
-                    core.setFill();
-                    NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-                        NSPoint::new(cx - r, cy - r),
-                        NSSize::new(r * 2.0, r * 2.0),
-                    ))
-                    .fill();
-                }
-                let g_font = NSFont::boldSystemFontOfSize(r * 0.95);
-                let g_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.043, 0.043, 0.051, 0.92);
-                draw_text_centered("G", r * 2.0, cy - r * 0.62, &g_font, &g_color);
-                // 手动把 G 平移到圆心 (draw_text_centered 以宽度参数居中)
-                // 上面以 2r 宽度居中即可对准圆心。
 
-                // 4. 角标: 左下 "预览"，右下 当前效果名
-                let cap_font = NSFont::systemFontOfSize(10.5);
-                let cap_color = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.55);
-                draw_text_left("预览", 12.0, 7.0, &cap_font, &cap_color);
-                let effect_name = match mode {
-                    0 => "关闭",
-                    1 => "固定色",
-                    2 => "彩色循环",
-                    _ => "呼吸",
-                };
-                let period_s = self.ivars().period_ms.get() as f64 / 1000.0;
-                let right_text = if mode == 2 || mode == 3 {
-                    format!("{effect_name} · {period_s:.1}s")
-                } else {
-                    effect_name.to_string()
-                };
-                draw_text_right(&right_text, w - 12.0, 7.0, &cap_font, &cap_color);
+                    // 居中绘制 G 字母
+                    let g_font = NSFont::boldSystemFontOfSize(r * 1.05);
+                    let g_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.04, 0.04, 0.05, 0.95);
+                    draw_text_at_center("G", logo_cx, logo_cy, &g_font, &g_color);
+
+                    ctx.restoreGraphicsState();
+                }
+
+                outer_path.setLineWidth(1.0);
+                PopoverPanel::color_card_line().setStroke();
+                outer_path.stroke();
             }
         }
     }
@@ -1175,7 +1288,7 @@ impl PopoverPanel {
     pub const DPI_PRESETS: &'static [u16] = &[400, 800, 1600, 3200, 6400];
     pub const PANEL_WIDTH: f64 = 1000.0;
     pub const PANEL_HEIGHT: f64 = 660.0;
-    pub const SIDEBAR_WIDTH: f64 = 196.0;
+    pub const SIDEBAR_WIDTH: f64 = 176.0;
 
     pub fn slider_to_dpi(t: f64) -> u16 {
         let t = t.clamp(0.0, 1.0);
@@ -1193,17 +1306,17 @@ impl PopoverPanel {
 
     /// 主文字 #1D1D1F
     pub fn color_primary_text() -> Retained<NSColor> {
-        unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(0.114, 0.114, 0.122, 1.0) }
+        unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(0.941, 0.957, 0.973, 1.0) }
     }
 
     /// 辅助文字 #6E6E73
     pub fn color_secondary_text() -> Retained<NSColor> {
-        unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(0.431, 0.431, 0.451, 1.0) }
+        unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(0.643, 0.690, 0.737, 1.0) }
     }
 
     /// 强调蓝 #007AFF
     pub fn color_accent() -> Retained<NSColor> {
-        unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.478, 1.0, 1.0) }
+        unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.808, 1.0, 1.0) }
     }
 
     /// 罗技 / macOS 活力蓝 (兼容旧命名)
@@ -1230,22 +1343,22 @@ impl PopoverPanel {
 
     /// 空闲灰 #A1A1A6
     pub fn color_idle_gray() -> Retained<NSColor> {
-        unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(0.631, 0.631, 0.651, 1.0) }
+        unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(0.510, 0.557, 0.608, 1.0) }
     }
 
-    /// 卡片描边 rgba(0,0,0,.10)
+    /// 卡片描边 #26292E
     fn color_card_line() -> Retained<NSColor> {
-        unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(0.851, 0.851, 0.871, 1.0) }
+        unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(0.149, 0.161, 0.180, 1.0) }
     }
 
-    /// 主窗口底色 #F6F6F8
+    /// 主窗口底色 #111216
     fn color_window_bg() -> Retained<NSColor> {
-        unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(0.965, 0.965, 0.973, 1.0) }
+        unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(0.067, 0.071, 0.086, 1.0) }
     }
 
-    /// 侧边栏底色 #ECECF0
+    /// 侧边栏底色 #0B0C0E
     fn color_sidebar_bg() -> Retained<NSColor> {
-        unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(0.925, 0.925, 0.941, 1.0) }
+        unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(0.043, 0.047, 0.055, 1.0) }
     }
 
     pub fn init(mtm: MainThreadMarker) {
@@ -1281,7 +1394,7 @@ impl PopoverPanel {
             panel.setTitle(&NSString::from_str("G502 LIGHTSPEED · 设置"));
             panel.setTitlebarAppearsTransparent(true);
             panel.setTitleVisibility(NSWindowTitleVisibility::NSWindowTitleHidden);
-            panel.setAppearance(NSAppearance::appearanceNamed(NSAppearanceNameAqua).as_deref());
+            panel.setAppearance(NSAppearance::appearanceNamed(NSAppearanceNameDarkAqua).as_deref());
             panel.setReleasedWhenClosed(false);
             panel.setBackgroundColor(Some(&NSColor::clearColor()));
             panel.setHasShadow(true);
@@ -1335,15 +1448,17 @@ impl PopoverPanel {
         }
 
         // ==================================================================== //
-        // 1. 左侧边栏 (196pt, #ECECF0)
+        // 1. 左侧边栏 (176pt, 经典电竞深色导航控制台)
         // ==================================================================== //
+        let sidebar_inner_width = sidebar_width - 24.0; // 152.0 pt, 左右各留 12pt 边距确保绝对对称
         let sidebar_box = unsafe { NSBox::new(mtm) };
         unsafe {
             sidebar_box.setBoxType(NSBoxType::NSBoxCustom);
             sidebar_box.setCornerRadius(12.0);
-            sidebar_box.setBorderWidth(0.0);
+            sidebar_box.setBorderWidth(1.0);
+            sidebar_box.setBorderColor(&Self::color_card_line());
             sidebar_box.setFillColor(&Self::color_sidebar_bg());
-            sidebar_box.setContentViewMargins(NSSize::new(12.0, 12.0));
+            sidebar_box.setContentViewMargins(NSSize::new(12.0, 14.0));
             sidebar_box
                 .widthAnchor()
                 .constraintEqualToConstant(sidebar_width)
@@ -1368,7 +1483,7 @@ impl PopoverPanel {
         unsafe {
             close_spacer
                 .widthAnchor()
-                .constraintEqualToConstant(40.0)
+                .constraintEqualToConstant(sidebar_inner_width)
                 .setActive(true);
             close_spacer
                 .heightAnchor()
@@ -1377,7 +1492,7 @@ impl PopoverPanel {
             sidebar_stack.addArrangedSubview(&close_spacer);
         }
 
-        // 设备块: 深色圆角 G 徽标 + G502 / LIGHTSPEED
+        // 设备块: 深色圆角 G 徽标 + G502 / LIGHTSPEED (水平居中对齐)
         let device_row = unsafe { NSStackView::new(mtm) };
         unsafe {
             device_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
@@ -1385,35 +1500,37 @@ impl PopoverPanel {
             device_row.setSpacing(10.0);
             device_row
                 .widthAnchor()
-                .constraintEqualToConstant(172.0)
+                .constraintEqualToConstant(sidebar_inner_width)
                 .setActive(true);
-            sidebar_stack.addArrangedSubview(&device_row);
+            device_row
+                .heightAnchor()
+                .constraintEqualToConstant(44.0)
+                .setActive(true);
         }
 
         let logo_box = unsafe { NSBox::new(mtm) };
         unsafe {
             logo_box.setBoxType(NSBoxType::NSBoxCustom);
-            logo_box.setCornerRadius(9.0);
+            logo_box.setCornerRadius(8.0);
             logo_box.setBorderWidth(1.0);
-            let border_c = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.15);
+            let border_c = NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.808, 1.0, 0.45);
             logo_box.setBorderColor(&border_c);
-            let bg_c = NSColor::colorWithSRGBRed_green_blue_alpha(0.227, 0.227, 0.251, 1.0);
+            let bg_c = NSColor::colorWithSRGBRed_green_blue_alpha(0.063, 0.075, 0.095, 1.0);
             logo_box.setFillColor(&bg_c);
             logo_box.setContentViewMargins(NSSize::new(2.0, 2.0));
             logo_box
                 .widthAnchor()
-                .constraintEqualToConstant(34.0)
+                .constraintEqualToConstant(36.0)
                 .setActive(true);
             logo_box
                 .heightAnchor()
-                .constraintEqualToConstant(34.0)
+                .constraintEqualToConstant(36.0)
                 .setActive(true);
-            device_row.addArrangedSubview(&logo_box);
         }
         let logo_label = unsafe { NSTextField::labelWithString(&NSString::from_str("G"), mtm) };
         unsafe {
-            logo_label.setFont(Some(&NSFont::boldSystemFontOfSize(17.0)));
-            let cyan = NSColor::colorWithSRGBRed_green_blue_alpha(0.216, 0.816, 1.0, 1.0);
+            logo_label.setFont(Some(&NSFont::boldSystemFontOfSize(18.0)));
+            let cyan = PopoverPanel::color_accent();
             logo_label.setTextColor(Some(&cyan));
             logo_label.setAlignment(NSTextAlignment::Center);
             logo_box.setContentView(Some(&logo_label));
@@ -1423,12 +1540,11 @@ impl PopoverPanel {
         unsafe {
             device_col.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
             device_col.setAlignment(NSLayoutAttribute::Leading);
-            device_col.setSpacing(0.0);
-            device_row.addArrangedSubview(&device_col);
+            device_col.setSpacing(1.0);
         }
         let device_name = unsafe { NSTextField::labelWithString(&NSString::from_str("G502"), mtm) };
         unsafe {
-            device_name.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+            device_name.setFont(Some(&NSFont::boldSystemFontOfSize(14.0)));
             device_name.setTextColor(Some(&Self::color_primary_text()));
             device_col.addArrangedSubview(&device_name);
         }
@@ -1440,73 +1556,124 @@ impl PopoverPanel {
             device_col.addArrangedSubview(&device_model);
         }
 
+        let dev_center_stack = unsafe { NSStackView::new(mtm) };
+        unsafe {
+            dev_center_stack.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+            dev_center_stack.setAlignment(NSLayoutAttribute::CenterY);
+            dev_center_stack.setSpacing(10.0);
+            dev_center_stack.addArrangedSubview(&logo_box);
+            dev_center_stack.addArrangedSubview(&device_col);
+            device_row.setAlignment(NSLayoutAttribute::CenterX);
+            device_row.addArrangedSubview(&dev_center_stack);
+            sidebar_stack.addArrangedSubview(&device_row);
+        }
+
+        // 顶部分隔线
+        let top_div = unsafe { Self::create_separator(mtm, sidebar_inner_width) };
+        unsafe {
+            sidebar_stack.addArrangedSubview(&top_div);
+        }
+
         let nav_gap = unsafe { NSView::new(mtm) };
         unsafe {
             nav_gap
                 .widthAnchor()
-                .constraintEqualToConstant(40.0)
+                .constraintEqualToConstant(sidebar_inner_width)
                 .setActive(true);
             nav_gap
                 .heightAnchor()
-                .constraintEqualToConstant(16.0)
+                .constraintEqualToConstant(18.0)
                 .setActive(true);
             sidebar_stack.addArrangedSubview(&nav_gap);
         }
 
-        let nav_label = unsafe { NSTextField::labelWithString(&NSString::from_str("设置"), mtm) };
+        let nav_label_row = unsafe { NSStackView::new(mtm) };
         unsafe {
-            nav_label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-            nav_label.setTextColor(Some(&Self::color_idle_gray()));
-            nav_label
+            nav_label_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+            nav_label_row.setAlignment(NSLayoutAttribute::CenterY);
+            nav_label_row
                 .widthAnchor()
-                .constraintEqualToConstant(172.0)
+                .constraintEqualToConstant(sidebar_inner_width)
                 .setActive(true);
-            sidebar_stack.addArrangedSubview(&nav_label);
+            nav_label_row
+                .heightAnchor()
+                .constraintEqualToConstant(18.0)
+                .setActive(true);
+        }
+        let nav_label_spacer = unsafe { NSView::new(mtm) };
+        unsafe {
+            nav_label_spacer
+                .widthAnchor()
+                .constraintEqualToConstant(14.0)
+                .setActive(true);
+            nav_label_row.addArrangedSubview(&nav_label_spacer);
+        }
+        let nav_label = unsafe { NSTextField::labelWithString(&NSString::from_str("功能设置"), mtm) };
+        unsafe {
+            nav_label.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
+            nav_label.setTextColor(Some(&Self::color_idle_gray()));
+            nav_label_row.addArrangedSubview(&nav_label);
+            sidebar_stack.addArrangedSubview(&nav_label_row);
         }
 
         let nav_gap2 = unsafe { NSView::new(mtm) };
         unsafe {
             nav_gap2
                 .widthAnchor()
-                .constraintEqualToConstant(40.0)
+                .constraintEqualToConstant(sidebar_inner_width)
                 .setActive(true);
             nav_gap2
                 .heightAnchor()
-                .constraintEqualToConstant(6.0)
+                .constraintEqualToConstant(8.0)
                 .setActive(true);
             sidebar_stack.addArrangedSubview(&nav_gap2);
         }
 
-        // 3 个导航行: DPI / 灯效 / 宏·文字 (SF Symbol 图标 + 选中蓝底)
+        // 3 个导航行: DPI / 灯效 / 宏·文字 (44pt 舒适电竞导航条，8pt 间距)
         let nav_specs: [(&str, &str, usize); 3] = [
-            ("speedometer", "DPI", 0),
-            ("lightbulb", "灯效", 1),
-            ("keyboard", "宏 / 文字", 2),
+            ("speedometer", "DPI 灵敏度", 0),
+            ("lightbulb", "LIGHTSYNC 灯效", 1),
+            ("keyboard", "按键指派与宏", 2),
         ];
         let mut nav_rows = Vec::new();
-        for (symbol, title, tag) in nav_specs {
-            let icon_normal = unsafe { tinted_symbol(symbol, 17.0, &Self::color_accent()) };
-            let icon_selected = unsafe { tinted_symbol(symbol, 17.0, &NSColor::whiteColor()) };
+        for (i, (symbol, title, tag)) in nav_specs.iter().enumerate() {
+            let icon_normal = unsafe { tinted_symbol(symbol, 18.0, &Self::color_accent()) };
+            let icon_selected = unsafe { tinted_symbol(symbol, 18.0, &NSColor::whiteColor()) };
             let row = G502NavRow::new(
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(172.0, 30.0)),
-                tag,
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(sidebar_inner_width, 44.0)),
+                *tag,
                 title,
                 icon_normal,
                 icon_selected,
             );
             unsafe {
                 row.widthAnchor()
-                    .constraintEqualToConstant(172.0)
+                    .constraintEqualToConstant(sidebar_inner_width)
                     .setActive(true);
                 row.heightAnchor()
-                    .constraintEqualToConstant(30.0)
+                    .constraintEqualToConstant(44.0)
                     .setActive(true);
                 sidebar_stack.addArrangedSubview(&row);
+            }
+            if i < 2 {
+                let row_gap = unsafe { NSView::new(mtm) };
+                unsafe {
+                    row_gap
+                        .widthAnchor()
+                        .constraintEqualToConstant(sidebar_inner_width)
+                        .setActive(true);
+                    row_gap
+                        .heightAnchor()
+                        .constraintEqualToConstant(8.0)
+                        .setActive(true);
+                    sidebar_stack.addArrangedSubview(&row_gap);
+                }
             }
             nav_rows.push(row);
         }
         nav_rows[0].set_selected(true);
 
+        // 下部弹性占位 (与上部弹性占位对应，完美平衡垂直空间)
         let sidebar_bottom_spacer = unsafe { NSView::new(mtm) };
         unsafe {
             sidebar_bottom_spacer.setContentHuggingPriority_forOrientation(
@@ -1514,6 +1681,102 @@ impl PopoverPanel {
                 NSLayoutConstraintOrientation::Vertical,
             );
             sidebar_stack.addArrangedSubview(&sidebar_bottom_spacer);
+        }
+
+        // 底部硬件状态卡片 (彻底消除下半部分大面积空白不对称)
+        let bottom_div = unsafe { Self::create_separator(mtm, sidebar_inner_width) };
+        unsafe {
+            sidebar_stack.addArrangedSubview(&bottom_div);
+        }
+
+        let bottom_gap = unsafe { NSView::new(mtm) };
+        unsafe {
+            bottom_gap
+                .widthAnchor()
+                .constraintEqualToConstant(sidebar_inner_width)
+                .setActive(true);
+            bottom_gap
+                .heightAnchor()
+                .constraintEqualToConstant(12.0)
+                .setActive(true);
+            sidebar_stack.addArrangedSubview(&bottom_gap);
+        }
+
+        let info_box = unsafe { NSBox::new(mtm) };
+        unsafe {
+            info_box.setBoxType(NSBoxType::NSBoxCustom);
+            info_box.setCornerRadius(8.0);
+            info_box.setBorderWidth(1.0);
+            let border_c = NSColor::colorWithSRGBRed_green_blue_alpha(0.149, 0.161, 0.180, 1.0);
+            info_box.setBorderColor(&border_c);
+            let bg_c = NSColor::colorWithSRGBRed_green_blue_alpha(0.055, 0.059, 0.071, 1.0);
+            info_box.setFillColor(&bg_c);
+            info_box.setContentViewMargins(NSSize::new(10.0, 8.0));
+            info_box
+                .widthAnchor()
+                .constraintEqualToConstant(sidebar_inner_width)
+                .setActive(true);
+            info_box
+                .heightAnchor()
+                .constraintEqualToConstant(58.0)
+                .setActive(true);
+            sidebar_stack.addArrangedSubview(&info_box);
+        }
+
+        let info_stack = unsafe { NSStackView::new(mtm) };
+        unsafe {
+            info_stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+            info_stack.setAlignment(NSLayoutAttribute::Leading);
+            info_stack.setSpacing(2.0);
+            info_box.setContentView(Some(&info_stack));
+        }
+
+        let status_row = unsafe { NSStackView::new(mtm) };
+        unsafe {
+            status_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+            status_row.setAlignment(NSLayoutAttribute::CenterY);
+            status_row.setSpacing(6.0);
+            info_stack.addArrangedSubview(&status_row);
+        }
+        let dot_view = unsafe { NSBox::new(mtm) };
+        unsafe {
+            dot_view.setBoxType(NSBoxType::NSBoxCustom);
+            dot_view.setCornerRadius(3.5);
+            dot_view.setBorderWidth(0.0);
+            dot_view.setFillColor(&Self::color_success_green());
+            dot_view
+                .widthAnchor()
+                .constraintEqualToConstant(7.0)
+                .setActive(true);
+            dot_view
+                .heightAnchor()
+                .constraintEqualToConstant(7.0)
+                .setActive(true);
+            status_row.addArrangedSubview(&dot_view);
+        }
+        let status_label = unsafe { NSTextField::labelWithString(&NSString::from_str("LIGHTSPEED 无线"), mtm) };
+        unsafe {
+            status_label.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
+            status_label.setTextColor(Some(&Self::color_primary_text()));
+            status_row.addArrangedSubview(&status_label);
+        }
+
+        let sensor_label = unsafe {
+            NSTextField::labelWithString(&NSString::from_str("HERO 25K 传感器 · 1ms"), mtm)
+        };
+        unsafe {
+            sensor_label.setFont(Some(&NSFont::systemFontOfSize(9.5)));
+            sensor_label.setTextColor(Some(&Self::color_secondary_text()));
+            info_stack.addArrangedSubview(&sensor_label);
+        }
+
+        let mem_label = unsafe {
+            NSTextField::labelWithString(&NSString::from_str("板载模式支持 · 1000Hz"), mtm)
+        };
+        unsafe {
+            mem_label.setFont(Some(&NSFont::systemFontOfSize(9.0)));
+            mem_label.setTextColor(Some(&Self::color_idle_gray()));
+            info_stack.addArrangedSubview(&mem_label);
         }
 
         // ==================================================================== //
@@ -1652,7 +1915,7 @@ impl PopoverPanel {
             battery_pill.setBorderWidth(1.0);
             battery_pill.setBorderColor(&Self::color_card_line());
             battery_pill.setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
-                1.0, 1.0, 1.0, 1.0,
+                0.12, 0.13, 0.16, 1.0,
             ));
             battery_pill.setContentViewMargins(NSSize::new(10.0, 4.0));
             battery_pill.setContentView(Some(&battery_pill_stack));
@@ -1660,7 +1923,7 @@ impl PopoverPanel {
             content_stack.addArrangedSubview(&header_row);
         }
 
-        // 2.2 按键示意图白卡 (764 × 256, 内含透明画布)
+        // 2.2 按键示意图画布卡片 (内含深色实机画布)
         let diagram_box = unsafe { NSBox::new(mtm) };
         unsafe {
             diagram_box.setBoxType(NSBoxType::NSBoxCustom);
@@ -1668,7 +1931,7 @@ impl PopoverPanel {
             diagram_box.setBorderWidth(1.0);
             diagram_box.setBorderColor(&Self::color_card_line());
             diagram_box.setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
-                1.0, 1.0, 1.0, 1.0,
+                0.075, 0.078, 0.090, 1.0,
             ));
             diagram_box.setContentViewMargins(NSSize::new(8.0, 8.0));
             diagram_box
@@ -1702,7 +1965,7 @@ impl PopoverPanel {
             diagram_box.setContentView(Some(&mouse_canvas));
         }
 
-        // 2.3 功能抽屉白卡 (764 × 314)
+        // 2.3 功能抽屉深色卡片
         let drawer_box = unsafe { NSBox::new(mtm) };
         unsafe {
             drawer_box.setBoxType(NSBoxType::NSBoxCustom);
@@ -1710,7 +1973,7 @@ impl PopoverPanel {
             drawer_box.setBorderWidth(1.0);
             drawer_box.setBorderColor(&Self::color_card_line());
             drawer_box.setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
-                1.0, 1.0, 1.0, 1.0,
+                0.094, 0.098, 0.114, 1.0,
             ));
             drawer_box.setContentViewMargins(NSSize::new(card_lr, 14.0));
             drawer_box
@@ -1940,13 +2203,15 @@ impl PopoverPanel {
             dpi_stack.addArrangedSubview(&rate_control_row);
         }
 
-        // 快捷提示条 (浅蓝底)
+        // 快捷提示条 (深青底)
         let tip_box = unsafe { NSBox::new(mtm) };
         unsafe {
             tip_box.setBoxType(NSBoxType::NSBoxCustom);
             tip_box.setCornerRadius(9.0);
-            tip_box.setBorderWidth(0.0);
-            let tip_bg = NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.478, 1.0, 0.09);
+            tip_box.setBorderWidth(1.0);
+            let border_c = NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.808, 1.0, 0.20);
+            tip_box.setBorderColor(&border_c);
+            let tip_bg = NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.808, 1.0, 0.08);
             tip_box.setFillColor(&tip_bg);
             tip_box.setContentViewMargins(NSSize::new(12.0, 8.0));
             tip_box
@@ -2014,7 +2279,8 @@ impl PopoverPanel {
         let rgb_top_row = unsafe { NSStackView::new(mtm) };
         unsafe {
             rgb_top_row.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
-            rgb_top_row.setSpacing(40.0);
+            rgb_top_row.setAlignment(NSLayoutAttribute::Top);
+            rgb_top_row.setSpacing(32.0);
             rgb_top_row
                 .widthAnchor()
                 .constraintEqualToConstant(drawer_inner_width)
@@ -2051,7 +2317,14 @@ impl PopoverPanel {
         };
         unsafe {
             zone_control.setSelectedSegment(0);
-            zone_control.setSegmentStyle(NSSegmentStyle::Rounded);
+            zone_control.setSegmentStyle(NSSegmentStyle::TexturedRounded);
+            zone_control
+                .heightAnchor()
+                .constraintEqualToConstant(28.0)
+                .setActive(true);
+            for i in 0..3 {
+                zone_control.setWidth_forSegment(88.0, i);
+            }
             zone_col.addArrangedSubview(&zone_control);
         }
 
@@ -2086,15 +2359,22 @@ impl PopoverPanel {
         };
         unsafe {
             effect_control.setSelectedSegment(3);
-            effect_control.setSegmentStyle(NSSegmentStyle::Rounded);
+            effect_control.setSegmentStyle(NSSegmentStyle::TexturedRounded);
+            effect_control
+                .heightAnchor()
+                .constraintEqualToConstant(28.0)
+                .setActive(true);
+            for i in 0..4 {
+                effect_control.setWidth_forSegment(76.0, i);
+            }
             effect_col.addArrangedSubview(&effect_control);
             rgb_stack.addArrangedSubview(&rgb_top_row);
         }
 
-        // 机身灯效预览 (深色底板 + 灯带/G 标发光)
+        // 机身灯效预览 (深色底板 + 灯带/G 标双区独立发光指示)
         let led_preview = LedPreviewView::new(NSRect::new(
             NSPoint::new(0.0, 0.0),
-            NSSize::new(drawer_inner_width, 84.0),
+            NSSize::new(drawer_inner_width, 88.0),
         ));
         unsafe {
             led_preview
@@ -2103,7 +2383,7 @@ impl PopoverPanel {
                 .setActive(true);
             led_preview
                 .heightAnchor()
-                .constraintEqualToConstant(84.0)
+                .constraintEqualToConstant(88.0)
                 .setActive(true);
             rgb_stack.addArrangedSubview(&led_preview);
         }
@@ -2461,25 +2741,25 @@ impl PopoverPanel {
                 badge_box.setBoxType(NSBoxType::NSBoxCustom);
                 badge_box.setCornerRadius(6.0);
                 badge_box.setBorderWidth(1.0);
-                let border_c = NSColor::colorWithSRGBRed_green_blue_alpha(0.82, 0.86, 0.92, 1.0);
+                let border_c = NSColor::colorWithSRGBRed_green_blue_alpha(0.20, 0.23, 0.28, 1.0);
                 badge_box.setBorderColor(&border_c);
-                let bg_c = NSColor::colorWithSRGBRed_green_blue_alpha(0.94, 0.96, 0.99, 1.0);
+                let bg_c = NSColor::colorWithSRGBRed_green_blue_alpha(0.12, 0.14, 0.17, 1.0);
                 badge_box.setFillColor(&bg_c);
                 badge_box.setContentViewMargins(NSSize::new(2.0, 2.0));
                 badge_box
                     .widthAnchor()
-                    .constraintEqualToConstant(76.0)
+                    .constraintEqualToConstant(82.0)
                     .setActive(true);
             }
             let badge_title = match gk.name {
-                "G4" => "G4 · 后退",
-                "G5" => "G5 · 前进",
-                "G6" => "G6 · 瞄准",
-                "G7" => "G7 · DPI-",
-                "G8" => "G8 · DPI+",
-                "G9" => "G9 · ⚡️电量",
-                "G10" => "G10 · 滚轮左",
-                "G11" => "G11 · 滚轮右",
+                "G4" => "G4 后退",
+                "G5" => "G5 前进",
+                "G6" => "G6 瞄准",
+                "G7" => "G7 DPI-",
+                "G8" => "G8 DPI+",
+                "G9" => "G9 电量",
+                "G10" => "G10 滚轮左",
+                "G11" => "G11 滚轮右",
                 _ => gk.name,
             };
             let name_label =
@@ -2522,7 +2802,7 @@ impl PopoverPanel {
                     "在此输入自动打字文字 (输入即生效)...",
                 )));
                 text_input.setTextColor(Some(&Self::color_primary_text()));
-                let input_bg = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 1.0);
+                let input_bg = NSColor::colorWithSRGBRed_green_blue_alpha(0.12, 0.13, 0.16, 1.0);
                 text_input.setBackgroundColor(Some(&input_bg));
                 text_input.setDrawsBackground(true);
                 text_input
@@ -2710,6 +2990,7 @@ impl PopoverPanel {
         // 调试快照目录 (自动化视觉验证)
         if let Ok(dir) = std::env::var("G502HUB_SNAPSHOT") {
             let _ = SNAPSHOT_PATH.set(dir);
+            Self::request_show();
         }
         if let Ok(tab) = std::env::var("G502HUB_SNAPSHOT_TAB") {
             if let Ok(tab) = tab.parse::<usize>() {
@@ -2838,10 +3119,10 @@ impl PopoverPanel {
         );
 
         if is_selected {
-            // 外层选中指示对焦环 (系统蓝)
+            // 外层选中指示对焦环 (电竞罗技青)
             let ring_rect = NSRect::new(NSPoint::new(1.0, 1.0), NSSize::new(24.0, 24.0));
             let ring = NSBezierPath::bezierPathWithOvalInRect(ring_rect);
-            let ring_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.478, 1.0, 1.0);
+            let ring_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.808, 1.0, 1.0);
             ring_color.setStroke();
             ring.setLineWidth(2.0);
             ring.stroke();
@@ -2885,6 +3166,21 @@ impl PopoverPanel {
 
                 for (i, row) in h.nav_rows.iter().enumerate() {
                     row.set_selected(i == tab_idx);
+                }
+
+                h.mouse_canvas.set_tab(tab_idx);
+                if tab_idx == 1 {
+                    unsafe {
+                        h.mouse_view_control.setSelectedSegment(0);
+                    }
+                    h.mouse_canvas.set_mode(CanvasMode::Top);
+                    let seg = unsafe { h.zone_control.selectedSegment() } as usize;
+                    let key = match seg {
+                        1 => Some("主要灯带".to_string()),
+                        2 => Some("G 标志".to_string()),
+                        _ => None,
+                    };
+                    h.mouse_canvas.set_selected_key(key);
                 }
             }
         });
@@ -2966,65 +3262,56 @@ impl PopoverPanel {
         } else {
             HOLDER.with(|cell| {
                 if let Some(h) = cell.borrow().as_ref() {
-                    h.panel.makeKeyAndOrderFront(None);
+                    h.panel.orderOut(None);
                 }
             });
         }
     }
 
-    pub fn show_at(tray_rect: Option<tray_icon::Rect>) {
+    pub fn show_at(_tray_rect: Option<tray_icon::Rect>) {
         Self::sync_ui_from_config();
         HOLDER.with(|cell| {
             if let Some(h) = cell.borrow().as_ref() {
+                let mtm = MainThreadMarker::from(&*h.panel);
                 let panel_frame = h.panel.frame();
 
-                let (origin_x, origin_y) = if let Some(rect) = tray_rect {
-                    let screen_frame = NSScreen::mainScreen(MainThreadMarker::from(&*h.panel))
-                        .map(|s| s.visibleFrame())
-                        .unwrap_or(NSRect::new(
-                            NSPoint::new(0.0, 0.0),
-                            NSSize::new(1440.0, 900.0),
-                        ));
+                if h.panel.isVisible() {
+                    let app = NSApplication::sharedApplication(mtm);
+                    #[allow(deprecated)]
+                    app.activateIgnoringOtherApps(true);
+                    h.panel.makeKeyAndOrderFront(None);
+                    return;
+                }
 
-                    let mut x = rect.position.x + (rect.size.width as f64 / 2.0)
-                        - (panel_frame.size.width / 2.0);
-                    let mut y = screen_frame.origin.y + screen_frame.size.height
-                        - panel_frame.size.height
-                        - 4.0;
+                // 计算屏幕中央黄金展示位置 (自适应可见工作区与视网膜缩放)
+                let screen_frame = NSScreen::mainScreen(mtm)
+                    .map(|s| s.visibleFrame())
+                    .unwrap_or(NSRect::new(
+                        NSPoint::new(0.0, 0.0),
+                        NSSize::new(1440.0, 900.0),
+                    ));
 
-                    let max_x = screen_frame.origin.x + screen_frame.size.width
-                        - panel_frame.size.width
-                        - 8.0;
-                    let min_x = screen_frame.origin.x + 8.0;
-                    if x > max_x {
-                        x = max_x;
-                    }
-                    if x < min_x {
-                        x = min_x;
-                    }
-                    if y < screen_frame.origin.y + 8.0 {
-                        y = screen_frame.origin.y + 8.0;
-                    }
-                    (x, y)
-                } else {
-                    let screen_frame = NSScreen::mainScreen(MainThreadMarker::from(&*h.panel))
-                        .map(|s| s.visibleFrame())
-                        .unwrap_or(NSRect::new(
-                            NSPoint::new(0.0, 0.0),
-                            NSSize::new(1440.0, 900.0),
-                        ));
-                    let x = screen_frame.origin.x + screen_frame.size.width
-                        - panel_frame.size.width
-                        - 24.0;
-                    let y = screen_frame.origin.y + screen_frame.size.height
-                        - panel_frame.size.height
-                        - 4.0;
-                    (x, y)
-                };
+                let ideal_x = screen_frame.origin.x
+                    + (screen_frame.size.width - panel_frame.size.width) * 0.5;
+                let ideal_y = screen_frame.origin.y
+                    + (screen_frame.size.height - panel_frame.size.height) * 0.52;
+
+                let min_x = screen_frame.origin.x + 16.0;
+                let max_x = (screen_frame.origin.x + screen_frame.size.width
+                    - panel_frame.size.width
+                    - 16.0)
+                    .max(min_x);
+                let min_y = screen_frame.origin.y + 16.0;
+                let max_y = (screen_frame.origin.y + screen_frame.size.height
+                    - panel_frame.size.height
+                    - 16.0)
+                    .max(min_y);
+
+                let final_x = ideal_x.clamp(min_x, max_x);
+                let final_y = ideal_y.clamp(min_y, max_y);
 
                 unsafe {
-                    h.panel.setFrameOrigin(NSPoint::new(origin_x, origin_y));
-                    let mtm = MainThreadMarker::from(&*h.panel);
+                    h.panel.setFrameOrigin(NSPoint::new(final_x, final_y));
                     let app = NSApplication::sharedApplication(mtm);
                     #[allow(deprecated)]
                     app.activateIgnoringOtherApps(true);
@@ -3327,7 +3614,20 @@ impl PopoverPanel {
         }
     }
 
-    fn dispatch_zone(zone_idx: usize) {
+    pub fn dispatch_zone(zone_idx: usize) {
+        HOLDER.with(|cell| {
+            if let Some(h) = cell.borrow().as_ref() {
+                unsafe {
+                    h.zone_control.setSelectedSegment(zone_idx as isize);
+                }
+                let key = match zone_idx {
+                    1 => Some("主要灯带".to_string()),
+                    2 => Some("G 标志".to_string()),
+                    _ => None,
+                };
+                h.mouse_canvas.set_selected_key(key);
+            }
+        });
         Self::sync_ui_from_config_for_zone(zone_idx);
     }
 

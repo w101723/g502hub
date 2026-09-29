@@ -14,7 +14,7 @@ use objc2_app_kit::{
 use objc2_foundation::{
     MainThreadMarker, NSData, NSMutableDictionary, NSPoint, NSRect, NSSize, NSString,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 
 const TOP_PNG: &[u8] = include_bytes!("../assets/g502_top.png");
@@ -221,7 +221,36 @@ pub const SIDE_KEY_ZONES: &[ZonePolygon] = &[
     },
 ];
 
+/// 顶部视角灯效分区热区 (LIGHTSYNC 分区模式)
+pub const LIGHTING_ZONES: &[ZonePolygon] = &[
+    // 主要灯带: 鼠标左肩部 3 段式 LED 指示灯带
+    ZonePolygon {
+        key: "主要灯带",
+        desc: "侧边条",
+        points: &[(0.30, 0.48), (0.42, 0.48), (0.42, 0.66), (0.30, 0.66)],
+        hotspot: (0.355, 0.575),
+        badge_left: true,
+        badge_y_ratio: 0.58,
+        label_pos: (0.04, 0.58),
+        leader_start: (0.30, 0.58),
+        leader_end: (0.16, 0.58),
+    },
+    // G 标志: 鼠标掌托罗技 G 发光徽标
+    ZonePolygon {
+        key: "G 标志",
+        desc: "掌托",
+        points: &[(0.45, 0.20), (0.62, 0.20), (0.62, 0.38), (0.45, 0.38)],
+        hotspot: (0.530, 0.285),
+        badge_left: false,
+        badge_y_ratio: 0.30,
+        label_pos: (0.78, 0.30),
+        leader_start: (0.58, 0.29),
+        leader_end: (0.76, 0.30),
+    },
+];
+
 /// 根据当前模式和归一化坐标测试命中的按键
+#[allow(dead_code)]
 pub fn hit_test_key(mode: CanvasMode, nx: f64, ny: f64) -> Option<&'static str> {
     let zones = match mode {
         CanvasMode::Top => TOP_KEY_ZONES,
@@ -243,6 +272,7 @@ pub struct MouseCanvasIvars {
     pub bound_keys: RefCell<HashSet<String>>,
     pub clicked_key: RefCell<Option<String>>,
     pub tracking_area: RefCell<Option<Retained<NSTrackingArea>>>,
+    pub tab_idx: Cell<usize>,
 }
 
 impl Default for MouseCanvasIvars {
@@ -254,6 +284,7 @@ impl Default for MouseCanvasIvars {
             bound_keys: RefCell::new(HashSet::new()),
             clicked_key: RefCell::new(None),
             tracking_area: RefCell::new(None),
+            tab_idx: Cell::new(0),
         }
     }
 }
@@ -314,7 +345,8 @@ declare_class!(
                 return;
             }
             let mode = *self.ivars().mode.borrow();
-            let hit = Self::resolve_hit(mode, w, h, local_pt).map(|s| s.to_string());
+            let tab_idx = self.ivars().tab_idx.get();
+            let hit = Self::resolve_hit(mode, w, h, local_pt, tab_idx).map(|s| s.to_string());
 
             let mut hovered = self.ivars().hovered_key.borrow_mut();
             if *hovered != hit {
@@ -353,14 +385,25 @@ declare_class!(
                 return;
             }
             let mode = *self.ivars().mode.borrow();
-            if let Some(key) = Self::resolve_hit(mode, w, h, local_pt) {
+            let tab_idx = self.ivars().tab_idx.get();
+            if let Some(key) = Self::resolve_hit(mode, w, h, local_pt, tab_idx) {
                 let key_str = key.to_string();
                 *self.ivars().selected_key.borrow_mut() = Some(key_str.clone());
                 *self.ivars().clicked_key.borrow_mut() = Some(key_str);
                 unsafe { self.setNeedsDisplay(true) };
-                if let Some(gk) = crate::macro_engine::G_KEYS.iter().find(|gk| gk.name == key) {
+                if tab_idx == 1 {
+                    match key {
+                        "主要灯带" => crate::panel::PopoverPanel::dispatch_zone(1),
+                        "G 标志" => crate::panel::PopoverPanel::dispatch_zone(2),
+                        _ => crate::panel::PopoverPanel::dispatch_zone(0),
+                    }
+                } else if let Some(gk) = crate::macro_engine::G_KEYS.iter().find(|gk| gk.name == key) {
                     crate::panel::PopoverPanel::select_gkey(gk.id, true);
                 }
+            } else if tab_idx == 1 {
+                *self.ivars().selected_key.borrow_mut() = None;
+                unsafe { self.setNeedsDisplay(true) };
+                crate::panel::PopoverPanel::dispatch_zone(0);
             }
         }
 
@@ -380,13 +423,37 @@ declare_class!(
             let bound_set = self.ivars().bound_keys.borrow().clone();
 
             unsafe {
-                // 1. 透明底板：由外层白色卡片 (NSBox #FFFFFF) 提供背景，
-                //    对齐 macOS 设置窗口的卡片式层次 (参考设计稿 .diagram card)。
+                // 1. G HUB 原生深空炭黑画布底板 (#131417) 与精致微光切角微边框 (#26292E)
+                let bg_path =
+                    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bounds, 10.0, 10.0);
+                let bg_color =
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.075, 0.078, 0.090, 1.0);
+                bg_color.setFill();
+                bg_path.fill();
 
-                // 2. 计算等比居中视口 (避免在宽屏拉伸变形)
+                let rim_color =
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.149, 0.161, 0.180, 1.0);
+                rim_color.setStroke();
+                bg_path.setLineWidth(1.0);
+                bg_path.stroke();
+
+                // 2. 居中鼠标机身背光光晕 (微弱电竞蓝青环境光晕，强化空间层次)
                 let (dw, dh, ox, oy) = calc_viewport(w, h, mode);
+                let center_x = ox + dw * 0.5;
+                let center_y = oy + dh * 0.5;
+                let aura_w = dw * 0.75;
+                let aura_h = dh * 0.75;
+                let aura_rect = NSRect::new(
+                    NSPoint::new(center_x - aura_w * 0.5, center_y - aura_h * 0.5),
+                    NSSize::new(aura_w, aura_h),
+                );
+                let aura_path = NSBezierPath::bezierPathWithOvalInRect(aura_rect);
+                let aura_color =
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.80, 1.0, 0.035);
+                aura_color.setFill();
+                aura_path.fill();
 
-                // 4. 绘制 G502 原生高精实机机身渲染图
+                // 3. 绘制 G502 原生高精实机机身渲染图
                 let img_rect = NSRect::new(NSPoint::new(ox, oy), NSSize::new(dw, dh));
                 match mode {
                     CanvasMode::Top => {
@@ -401,14 +468,20 @@ declare_class!(
                     }
                 }
 
-                // 5. 绘制按键热区指示光圈、折线引出线与高对比度药丸徽章
+                // 4. 绘制按键/灯效分区指示光圈、折线引出线与高对比度药丸徽章
+                let tab = self.ivars().tab_idx.get();
                 let zones = match mode {
+                    CanvasMode::Top if tab == 1 => LIGHTING_ZONES,
                     CanvasMode::Top => TOP_KEY_ZONES,
                     CanvasMode::Side => SIDE_KEY_ZONES,
                 };
 
                 for z in zones {
-                    let is_sel = selected.as_deref() == Some(z.key);
+                    let is_sel = if tab == 1 && selected.is_none() {
+                        true // 全部联动时两分区均高亮激活
+                    } else {
+                        selected.as_deref() == Some(z.key)
+                    };
                     let is_hov = hovered.as_deref() == Some(z.key);
                     let is_bnd = bound_set.contains(z.key);
 
@@ -435,6 +508,16 @@ impl G502MouseCanvas {
         if *m != mode {
             *m = mode;
             drop(m);
+            unsafe { self.setNeedsDisplay(true) };
+        }
+    }
+
+    /// 设置当前功能页模式 (0: DPI, 1: 灯效, 2: 宏)
+    pub fn set_tab(&self, tab_idx: usize) {
+        if self.ivars().tab_idx.get() != tab_idx {
+            self.ivars().tab_idx.set(tab_idx);
+            *self.ivars().hovered_key.borrow_mut() = None;
+            *self.ivars().selected_key.borrow_mut() = None;
             unsafe { self.setNeedsDisplay(true) };
         }
     }
@@ -469,12 +552,14 @@ impl G502MouseCanvas {
         oy: f64,
         z: &ZonePolygon,
     ) -> NSRect {
-        let badge_w = 90.0;
+        // 灯效分区名称较长 (主要灯带 4 字 + 描述 3 字)，预留 118.0pt 保证药丸徽章绝不截断
+        let is_lighting = z.key == "主要灯带" || z.key == "G 标志";
+        let badge_w = if is_lighting { 118.0 } else { 96.0 };
         let badge_h = 22.0;
         let bx = if z.badge_left {
-            (ox - badge_w - 38.0).max(16.0)
+            (ox - badge_w - 24.0).max(12.0)
         } else {
-            (ox + dw + 38.0).min(w - badge_w - 16.0)
+            (ox + dw + 24.0).min(w - badge_w - 12.0)
         };
         let by = oy + z.badge_y_ratio * dh - badge_h * 0.5;
         NSRect::new(NSPoint::new(bx, by), NSSize::new(badge_w, badge_h))
@@ -486,9 +571,11 @@ impl G502MouseCanvas {
         w: f64,
         h: f64,
         local_pt: NSPoint,
+        tab_idx: usize,
     ) -> Option<&'static str> {
         let (dw, dh, ox, oy) = calc_viewport(w, h, mode);
         let zones = match mode {
+            CanvasMode::Top if tab_idx == 1 => LIGHTING_ZONES,
             CanvasMode::Top => TOP_KEY_ZONES,
             CanvasMode::Side => SIDE_KEY_ZONES,
         };
@@ -505,13 +592,13 @@ impl G502MouseCanvas {
             }
         }
 
-        // 2. 检查鼠标机身上的精确发光圆点热区 (半径 16pt)
+        // 2. 检查鼠标机身上的精确发光圆点热区 (半径 18pt)
         for z in zones {
             let hx = ox + z.hotspot.0 * dw;
             let hy = oy + z.hotspot.1 * dh;
             let dist_sq =
                 (local_pt.x - hx) * (local_pt.x - hx) + (local_pt.y - hy) * (local_pt.y - hy);
-            if dist_sq <= 16.0 * 16.0 {
+            if dist_sq <= 18.0 * 18.0 {
                 return Some(z.key);
             }
         }
@@ -519,8 +606,10 @@ impl G502MouseCanvas {
         // 3. 检查兼容性多边形区域 (Ray casting)
         let nx = ((local_pt.x - ox) / dw).clamp(0.0, 1.0);
         let ny = ((local_pt.y - oy) / dh).clamp(0.0, 1.0);
-        if let Some(k) = hit_test_key(mode, nx, ny) {
-            return Some(k);
+        for z in zones {
+            if point_in_polygon(nx, ny, z.points) {
+                return Some(z.key);
+            }
         }
 
         None
@@ -552,30 +641,38 @@ impl G502MouseCanvas {
         is_hovered: bool,
         is_bound: bool,
     ) {
-        // 1. 色彩管线 (macOS 系统简约明亮风格规范)
-        let (stroke_c, tag_bg_c, tag_fg_c) = if is_selected {
+        // 1. 色彩管线 (Logitech G HUB 原生深空炭黑与青色/电竞霓虹色彩标准)
+        // 选中: Logitech 亮青色 (#00CEFF) 实心/强发光
+        // 悬停: 亮青色边框 + 半透明深青背景
+        // 已绑定: 罗技电竞亮绿 (#10D070 / #2BD980) 强调配置激活
+        // 常规: 深灰炭黑胶囊 (#1E2126) + 柔和边界 (#3A3F47) + 高清晰字色
+        let (stroke_c, tag_bg_c, tag_fg_c, key_fg_c) = if is_selected {
             (
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.478, 1.0, 1.0),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.478, 1.0, 1.0),
-                NSColor::whiteColor(),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.808, 1.0, 1.0), // #00CEFF
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.04, 0.32, 0.45, 0.95), // 深青底
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.92, 0.98, 1.0, 1.0), // 亮白蓝文字
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.85, 1.0, 1.0),  // 纯青Key标
             )
         } else if is_hovered {
             (
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.478, 1.0, 1.0),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.90, 0.955, 1.0, 1.0),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.478, 1.0, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.18, 0.78, 1.0, 0.95),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.09, 0.18, 0.26, 0.92),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.85, 0.94, 1.0, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.35, 0.85, 1.0, 1.0),
             )
         } else if is_bound {
             (
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.188, 0.820, 0.345, 1.0),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.93, 0.98, 0.94, 1.0),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.106, 0.400, 0.150, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.169, 0.851, 0.502, 0.95), // 罗技绿 #2BD980
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.08, 0.19, 0.13, 0.90),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.80, 0.98, 0.88, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.20, 0.92, 0.55, 1.0),
             )
         } else {
             (
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.855, 0.855, 0.878, 1.0),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.949, 0.949, 0.961, 1.0),
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.114, 0.114, 0.122, 1.0),
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.227, 0.247, 0.278, 1.0), // #3A3F47
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.118, 0.129, 0.149, 0.92), // #1E2126
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.820, 0.840, 0.870, 1.0), // 浅灰中文字
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.550, 0.580, 0.630, 1.0), // 灰蓝键标
             )
         };
 
@@ -604,36 +701,51 @@ impl G502MouseCanvas {
         leader.lineToPoint(NSPoint::new(mid_x, target_y));
         leader.lineToPoint(NSPoint::new(target_x, target_y));
 
-        stroke_c.setStroke();
-        leader.setLineWidth(if is_selected || is_hovered { 1.5 } else { 1.0 });
+        let leader_color = if is_selected {
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.808, 1.0, 0.85)
+        } else if is_hovered {
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.18, 0.78, 1.0, 0.75)
+        } else if is_bound {
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.169, 0.851, 0.502, 0.60)
+        } else {
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.28, 0.31, 0.35, 0.50)
+        };
+        leader_color.setStroke();
+        leader.setLineWidth(if is_selected {
+            1.5
+        } else if is_hovered {
+            1.2
+        } else {
+            1.0
+        });
         leader.stroke();
 
         // 5. 绘制机身发光圆圈热区 (Hotspot Indicator)
         if is_selected || is_hovered {
-            let glow_r = 7.5;
+            let glow_r = if is_selected { 9.0 } else { 7.5 };
             let glow_rect = NSRect::new(
                 NSPoint::new(hx - glow_r, hy - glow_r),
                 NSSize::new(glow_r * 2.0, glow_r * 2.0),
             );
             let glow_path = NSBezierPath::bezierPathWithOvalInRect(glow_rect);
             let glow_c = if is_selected {
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.443, 0.890, 0.30)
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.808, 1.0, 0.35)
             } else {
-                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.443, 0.890, 0.18)
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.808, 1.0, 0.20)
             };
             glow_c.setFill();
             glow_path.fill();
         }
 
         // 外层热点光圈环
-        let ring_r = 4.0;
+        let ring_r = 4.5;
         let ring_rect = NSRect::new(
             NSPoint::new(hx - ring_r, hy - ring_r),
             NSSize::new(ring_r * 2.0, ring_r * 2.0),
         );
         let ring_path = NSBezierPath::bezierPathWithOvalInRect(ring_rect);
         stroke_c.setStroke();
-        ring_path.setLineWidth(1.2);
+        ring_path.setLineWidth(if is_selected { 1.5 } else { 1.0 });
         ring_path.stroke();
 
         // 核心发光微珠
@@ -643,12 +755,16 @@ impl G502MouseCanvas {
             NSSize::new(dot_r * 2.0, dot_r * 2.0),
         );
         let dot_path = NSBezierPath::bezierPathWithOvalInRect(dot_rect);
-        stroke_c.setFill();
+        if is_selected {
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.5, 0.95, 1.0, 1.0).setFill();
+        } else {
+            stroke_c.setFill();
+        }
         dot_path.fill();
 
         // 6. 绘制引出端电竞药丸徽章 (Capsule Badge)
         let badge_path =
-            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(badge_rect, 6.0, 6.0);
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(badge_rect, 5.0, 5.0);
         tag_bg_c.setFill();
         badge_path.fill();
 
@@ -656,29 +772,41 @@ impl G502MouseCanvas {
         badge_path.setLineWidth(if is_selected { 1.5 } else { 1.0 });
         badge_path.stroke();
 
-        // 7. 徽章内部双段文字: 按键代号 (灰) + 功能名 (主色)，对齐设计稿 .pill .k / .f
-        let key_color = if is_selected {
-            NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.92)
-        } else {
-            NSColor::colorWithSRGBRed_green_blue_alpha(0.431, 0.431, 0.451, 1.0)
-        };
-        let key_font = NSFont::boldSystemFontOfSize(10.5);
+        // 7. 徽章内部双段文字: 按键代号 (键标高亮) + 分隔点 + 中文功能名
+        let key_font = NSFont::boldSystemFontOfSize(10.0);
         let key_rect = NSRect::new(
-            NSPoint::new(bx + 7.0, by + 3.0),
-            NSSize::new(badge_w - 14.0, badge_h - 5.0),
+            NSPoint::new(bx + 6.0, by + 3.0),
+            NSSize::new(badge_w - 12.0, badge_h - 5.0),
         );
-        Self::draw_text(zone.key, key_rect, &key_font, &key_color);
+        Self::draw_text(zone.key, key_rect, &key_font, &key_fg_c);
 
         let key_w: f64 = {
             let s = NSString::from_str(zone.key);
-            let dict = Self::text_attributes(&key_font, &key_color);
+            let dict = Self::text_attributes(&key_font, &key_fg_c);
             let size: NSSize = msg_send![&*s, sizeWithAttributes: &*dict];
             size.width
         };
-        let desc_font = NSFont::systemFontOfSize(11.0);
+
+        // 紧凑分隔圆点
+        let dot_x = bx + 6.0 + key_w + 3.5;
+        let sep_dot_rect = NSRect::new(
+            NSPoint::new(dot_x, by + badge_h * 0.5 - 1.0),
+            NSSize::new(2.0, 2.0),
+        );
+        let sep_dot_path = NSBezierPath::bezierPathWithOvalInRect(sep_dot_rect);
+        let sep_color = if is_selected {
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.808, 1.0, 0.70)
+        } else {
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.40, 0.44, 0.50, 0.60)
+        };
+        sep_color.setFill();
+        sep_dot_path.fill();
+
+        let desc_font = NSFont::systemFontOfSize(10.0);
+        let desc_x = dot_x + 5.5;
         let desc_rect = NSRect::new(
-            NSPoint::new(bx + 9.0 + key_w, by + 2.5),
-            NSSize::new(badge_w - 16.0 - key_w, badge_h - 4.0),
+            NSPoint::new(desc_x, by + 2.5),
+            NSSize::new((badge_w - (desc_x - bx) - 4.0).max(10.0), badge_h - 4.0),
         );
         Self::draw_text(zone.desc, desc_rect, &desc_font, &tag_fg_c);
     }
@@ -794,5 +922,19 @@ mod tests {
         // 空平背景区域不应命中任何键
         assert_eq!(hit_test_key(CanvasMode::Side, 0.05, 0.05), None);
         assert_eq!(hit_test_key(CanvasMode::Side, 0.95, 0.95), None);
+    }
+
+    #[test]
+    fn test_lighting_zones_coverage() {
+        assert_eq!(LIGHTING_ZONES.len(), 2);
+        for z in LIGHTING_ZONES {
+            assert!(z.points.len() >= 3);
+            for &(x, y) in z.points {
+                assert!((0.0..=1.0).contains(&x));
+                assert!((0.0..=1.0).contains(&y));
+            }
+        }
+        assert_eq!(LIGHTING_ZONES[0].key, "主要灯带");
+        assert_eq!(LIGHTING_ZONES[1].key, "G 标志");
     }
 }
