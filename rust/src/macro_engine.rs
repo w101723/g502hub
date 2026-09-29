@@ -1815,6 +1815,9 @@ fn binding_enabled(key: &str) -> bool {
         .is_some_and(|binding| binding.enabled)
 }
 
+static LAST_TRIGGER: std::sync::Mutex<Option<std::collections::HashMap<String, std::time::Instant>>> =
+    std::sync::Mutex::new(None);
+
 fn queue_binding(key: &str) -> bool {
     let Ok(global_guard) = GLOBAL_BINDINGS.read() else {
         return false;
@@ -1831,6 +1834,25 @@ fn queue_binding(key: &str) -> bool {
     let actions = binding.actions.clone();
     drop(bindings_guard);
     drop(global_guard);
+
+    // 跨监听通道 (HID++ MouseButtonSpy 与系统 CGEventTap) 快速重复触发去重防抖 (120ms 窗口)
+    let now = std::time::Instant::now();
+    if let Ok(mut last_map_guard) = LAST_TRIGGER.lock() {
+        let map = last_map_guard.get_or_insert_with(std::collections::HashMap::new);
+        if let Some(last_time) = map.get(key) {
+            let elapsed = now.duration_since(*last_time);
+            if elapsed < std::time::Duration::from_millis(120) {
+                mlog(&format!(
+                    "去重防抖: 忽略 {key} 快速重复触发 (距上次仅 {}ms, 来自并行监听通道)",
+                    elapsed.as_millis()
+                ));
+                // 必须返回 true，通知 CGEventTap 吞掉该事件，阻止系统原生后退/前进/横向滚动
+                return true;
+            }
+        }
+        map.insert(key.to_string(), now);
+    }
+
     let Ok(tx_guard) = PLAYBACK_TX.read() else {
         return false;
     };
@@ -2279,5 +2301,47 @@ mod tests {
             let guard = b.read().unwrap();
             assert!(!guard.contains_key("mouse8"));
         }
+    }
+
+    #[test]
+    fn test_queue_binding_cross_channel_deduplication() {
+        let (tx, rx) = mpsc::channel::<(String, Vec<Action>)>();
+        *PLAYBACK_TX.write().unwrap() = Some(tx);
+
+        let mut bindings = BTreeMap::new();
+        bindings.insert(
+            "mouse3".to_string(),
+            MacroBinding {
+                name: Some("测试".into()),
+                enabled: true,
+                actions: vec![Action {
+                    keys: Some("cmd+c".into()),
+                    ..Action::default()
+                }],
+            },
+        );
+        *GLOBAL_BINDINGS.write().unwrap() = Some(Arc::new(RwLock::new(bindings)));
+
+        // 第一次触发（来自通道 A，如 MouseButtonSpy）
+        assert!(queue_binding("mouse3"));
+        assert!(rx.try_recv().is_ok());
+
+        // 快速第二次触发（来自通道 B，如 CGEventTap，间隔很短）
+        // 应该被去重，但返回 true 告知调用方吞掉系统事件
+        assert!(queue_binding("mouse3"));
+        assert!(rx.try_recv().is_err(), "短时间内重复触发不应向队列发送二次动作");
+
+        // 模拟等待超出防抖窗口后再次触发
+        if let Ok(mut last_map_guard) = LAST_TRIGGER.lock() {
+            if let Some(map) = last_map_guard.as_mut() {
+                map.insert("mouse3".to_string(), Instant::now() - Duration::from_millis(150));
+            }
+        }
+        assert!(queue_binding("mouse3"));
+        assert!(rx.try_recv().is_ok(), "超出防抖窗口后应正常接收下一次触发");
+
+        // 清理测试资源
+        *PLAYBACK_TX.write().unwrap() = None;
+        *GLOBAL_BINDINGS.write().unwrap() = None;
     }
 }
