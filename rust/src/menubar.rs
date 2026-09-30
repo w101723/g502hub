@@ -1105,16 +1105,12 @@ fn keep_online_after_battery_failure(failures: u8, interface_present: bool) -> b
 }
 
 fn wait_with_interface_watch(dev: &G502Device, seconds: u64) -> bool {
-    let mut remaining = seconds;
-    while remaining > 0 {
-        let step = remaining.min(2);
-        std::thread::sleep(Duration::from_secs(step));
-        remaining -= step;
-        if matches!(connection_interface_unchanged(dev), Ok(false)) {
-            return false;
-        }
-    }
-    true
+    // 睡眠指定秒数，并在独立的 autoreleasepool 中单次低频检查拓扑变化
+    // 避免旧逻辑中每 2 秒高频触发 hid_enumerate 导致的 IOKit HIDElement 堆内存泄漏
+    std::thread::sleep(Duration::from_secs(seconds));
+    objc2::rc::autoreleasepool(|_| {
+        !matches!(connection_interface_unchanged(dev), Ok(false))
+    })
 }
 
 /// 电量轮询线程：新连接、系统唤醒或待同步时恢复模式/DPI/RGB。
@@ -1126,109 +1122,117 @@ fn poll_loop(state: Arc<Mutex<State>>, led_sync_pending: Arc<AtomicBool>) {
     let mut state_sync_pending = false;
     let mut last_iteration = Instant::now();
     loop {
-        if last_iteration.elapsed() >= SYSTEM_WAKE_GAP {
-            led_sync_pending.store(true, Ordering::Release);
-        }
-        last_iteration = Instant::now();
-        let cfg = config::load().unwrap_or_default();
-        let next_delay;
+        let (next_delay, should_invalidate) = objc2::rc::autoreleasepool(|_| {
+            if last_iteration.elapsed() >= SYSTEM_WAKE_GAP {
+                led_sync_pending.store(true, Ordering::Release);
+            }
+            last_iteration = Instant::now();
+            let cfg = config::load().unwrap_or_default();
+            let delay;
+            let mut invalidate = false;
 
-        if let Some(dev) = active.clone() {
-            match read_battery(&dev) {
-                Ok(battery) => {
-                    battery_failures = 0;
-                    next_delay = 5;
-                    publish_battery(&state, desc.clone(), battery.clone());
-                    if state_sync_pending {
-                        match controller::apply_desired_all(&dev, &cfg) {
-                            Ok((applied, led_synced)) => {
-                                publish_connected(
-                                    &state,
-                                    desc.clone(),
-                                    battery,
-                                    applied.dpi,
-                                    applied.mode,
-                                );
-                                state_sync_pending = false;
-                                led_sync_pending.store(!led_synced, Ordering::Release);
+            if let Some(dev) = active.clone() {
+                match read_battery(&dev) {
+                    Ok(battery) => {
+                        battery_failures = 0;
+                        delay = 5;
+                        publish_battery(&state, desc.clone(), battery.clone());
+                        if state_sync_pending {
+                            match controller::apply_desired_all(&dev, &cfg) {
+                                Ok((applied, led_synced)) => {
+                                    publish_connected(
+                                        &state,
+                                        desc.clone(),
+                                        battery,
+                                        applied.dpi,
+                                        applied.mode,
+                                    );
+                                    state_sync_pending = false;
+                                    led_sync_pending.store(!led_synced, Ordering::Release);
+                                }
+                                Err(e) => eprintln!("设备状态同步失败，将重试: {e}"),
                             }
-                            Err(e) => eprintln!("设备状态同步失败，将重试: {e}"),
+                        }
+                        let pending = led_sync_pending.load(Ordering::Acquire);
+                        if !state_sync_pending && cfg.desired_mode == DesiredMode::Host && pending {
+                            let latest = config::load().unwrap_or(cfg);
+                            match controller::apply_desired_led(&dev, &latest) {
+                                Ok(()) => {
+                                    led_sync_pending.store(false, Ordering::Release);
+                                }
+                                Err(e) => {
+                                    eprintln!("RGB 自动同步失败: {e}");
+                                    led_sync_pending.store(true, Ordering::Release);
+                                }
+                            }
                         }
                     }
-                    let pending = led_sync_pending.load(Ordering::Acquire);
-                    if !state_sync_pending && cfg.desired_mode == DesiredMode::Host && pending {
-                        let latest = config::load().unwrap_or(cfg);
-                        match controller::apply_desired_led(&dev, &latest) {
-                            Ok(()) => {
-                                led_sync_pending.store(false, Ordering::Release);
-                            }
-                            Err(e) => {
-                                eprintln!("RGB 自动同步失败: {e}");
-                                led_sync_pending.store(true, Ordering::Release);
-                            }
+                    Err(e) => {
+                        battery_failures = battery_failures.saturating_add(1);
+                        eprintln!("电量轮询失败 ({battery_failures}/2): {e}");
+                        if keep_online_after_battery_failure(
+                            battery_failures,
+                            g502_interface_present().unwrap_or(true),
+                        ) {
+                            delay = 1;
+                        } else {
+                            active = None;
+                            battery_failures = 0;
+                            state_sync_pending = false;
+                            led_sync_pending.store(true, Ordering::Release);
+                            invalidate = true;
+                            delay = 2;
+                            publish_offline(&state, e.to_string());
                         }
                     }
                 }
-                Err(e) => {
-                    battery_failures = battery_failures.saturating_add(1);
-                    eprintln!("电量轮询失败 ({battery_failures}/2): {e}");
-                    if keep_online_after_battery_failure(
-                        battery_failures,
-                        g502_interface_present().unwrap_or(true),
-                    ) {
-                        next_delay = 1;
-                    } else {
-                        active = None;
-                        battery_failures = 0;
-                        state_sync_pending = false;
-                        led_sync_pending.store(true, Ordering::Release);
-                        invalidate_connection();
-                        next_delay = 2;
+            } else {
+                match crate::device::get_conn(0).and_then(|dev| {
+                    let device_desc = crate::device::describe(&dev);
+                    let battery = read_battery(&dev)?;
+                    let applied = controller::apply_desired_all(&dev, &cfg);
+                    let (applied, led_synced) = match applied {
+                        Ok(value) => (Some(value.0), value.1),
+                        Err(e) => {
+                            eprintln!("设备在线，状态同步稍后重试: {e}");
+                            (None, false)
+                        }
+                    };
+                    if let Some(applied) = applied {
+                        if cfg.desired_dpi.is_none() && applied.mode == OnboardMode::Host {
+                            if let Some(current_dpi) = applied.dpi {
+                                let _ = config::update(|latest| {
+                                    latest.desired_dpi = Some(current_dpi);
+                                });
+                            }
+                        }
+                    }
+                    Ok((dev, device_desc, battery, applied, led_synced))
+                }) {
+                    Ok((dev, device_desc, battery, applied, led_synced)) => {
+                        delay = if applied.is_some() { 5 } else { 2 };
+                        desc = device_desc;
+                        state_sync_pending = applied.is_none();
+                        led_sync_pending.store(!led_synced, Ordering::Release);
+                        if let Some(applied) = applied {
+                            publish_connected(&state, desc.clone(), battery, applied.dpi, applied.mode);
+                        } else {
+                            publish_partial(&state, desc.clone(), battery);
+                        }
+                        active = Some(dev);
+                    }
+                    Err(e) => {
+                        eprintln!("设备连接失败，将重试: {e}");
+                        delay = 2;
                         publish_offline(&state, e.to_string());
                     }
                 }
             }
-        } else {
-            match crate::device::get_conn(0).and_then(|dev| {
-                let device_desc = crate::device::describe(&dev);
-                let battery = read_battery(&dev)?;
-                let applied = controller::apply_desired_all(&dev, &cfg);
-                let (applied, led_synced) = match applied {
-                    Ok(value) => (Some(value.0), value.1),
-                    Err(e) => {
-                        eprintln!("设备在线，状态同步稍后重试: {e}");
-                        (None, false)
-                    }
-                };
-                if let Some(applied) = applied {
-                    if cfg.desired_dpi.is_none() && applied.mode == OnboardMode::Host {
-                        if let Some(current_dpi) = applied.dpi {
-                            let _ = config::update(|latest| {
-                                latest.desired_dpi = Some(current_dpi);
-                            });
-                        }
-                    }
-                }
-                Ok((dev, device_desc, battery, applied, led_synced))
-            }) {
-                Ok((dev, device_desc, battery, applied, led_synced)) => {
-                    next_delay = if applied.is_some() { 5 } else { 2 };
-                    desc = device_desc;
-                    state_sync_pending = applied.is_none();
-                    led_sync_pending.store(!led_synced, Ordering::Release);
-                    if let Some(applied) = applied {
-                        publish_connected(&state, desc.clone(), battery, applied.dpi, applied.mode);
-                    } else {
-                        publish_partial(&state, desc.clone(), battery);
-                    }
-                    active = Some(dev);
-                }
-                Err(e) => {
-                    eprintln!("设备连接失败，将重试: {e}");
-                    next_delay = 2;
-                    publish_offline(&state, e.to_string());
-                }
-            }
+            (delay, invalidate)
+        });
+
+        if should_invalidate {
+            invalidate_connection();
         }
 
         if let Some(dev) = active.clone() {
@@ -1348,7 +1352,9 @@ pub fn run() -> Result<()> {
         let core = core.clone();
         std::thread::spawn(move || {
             while let Ok(id) = rx.recv() {
-                core.handle(&id);
+                objc2::rc::autoreleasepool(|_| {
+                    core.handle(&id);
+                });
                 if QUIT.load(Ordering::Relaxed) {
                     std::process::exit(0);
                 }
@@ -1453,99 +1459,101 @@ extern "C" fn pump_callback(_timer: CFRunLoopTimerRef, info: *mut std::ffi::c_vo
     if info.is_null() {
         return;
     }
-    let app = unsafe { &mut *(info as *mut App) };
+    objc2::rc::autoreleasepool(|_| {
+        let app = unsafe { &mut *(info as *mut App) };
 
-    app.tap.expire_recording();
-    if recording_outcome_pending() {
-        if let Some(tx) = ACTION_TX.get() {
-            let _ = tx.send("macro:poll-recording".into());
-        }
-    }
-    let serial = recording_serial();
-    let recording_changed = serial != app.last_recording_serial;
-    if recording_changed {
-        app.last_recording_serial = serial;
-    }
-
-    // 0. 消费来自菜单或其他线程的弹窗请求
-    crate::panel::PopoverPanel::poll_open_request();
-
-    // 1. 托盘点击事件：左键弹出/收起 PopoverPanel (只响应 Down 避免双触发)
-    let tray_receiver = TrayIconEvent::receiver();
-    while let Ok(ev) = tray_receiver.try_recv() {
-        if let TrayIconEvent::Click {
-            button,
-            rect,
-            button_state,
-            ..
-        } = ev
-        {
-            if button == MouseButton::Left && button_state == tray_icon::MouseButtonState::Down {
-                crate::panel::PopoverPanel::toggle_at(Some(rect));
+        app.tap.expire_recording();
+        if recording_outcome_pending() {
+            if let Some(tx) = ACTION_TX.get() {
+                let _ = tx.send("macro:poll-recording".into());
             }
         }
-    }
-
-    // 2. 菜单事件 → 转发到工作线程(主线程不执行设备操作)
-    let receiver = MenuEvent::receiver();
-    while let Ok(ev) = receiver.try_recv() {
-        let id = ev.id().0.clone();
-        if id == "panel:open" {
-            crate::panel::PopoverPanel::show_at(None);
-            continue;
-        }
-        if let Some(tx) = ACTION_TX.get() {
-            let _ = tx.send(id);
-        }
-    }
-
-    app.ticks = app.ticks.wrapping_add(1);
-    let periodic_check = app.ticks % 5 == 0; // 每秒检查一次配置变更
-
-    if periodic_check {
-        if let Ok(cfg) = config::load() {
-            app.cfg = cfg;
-        }
-    }
-
-    // 3. 状态变化 → 快照后原地刷新(不持锁渲染)
-    let (snap, is_dirty) = {
-        let mut st = match app.state.try_lock() {
-            Ok(st) => st,
-            Err(_) => return, // 轮询线程正持有锁,下个 0.2s 周期再来
-        };
-        let dirty = st.dirty || recording_changed;
-        if dirty {
-            st.dirty = false;
-            (Some(st.snap.clone()), true)
-        } else if periodic_check {
-            (Some(st.snap.clone()), false)
-        } else {
-            (None, false)
-        }
-    };
-    if let Some(snap) = snap {
-        let connected = is_device_connected(&snap);
-        let target_visible = if app.cfg.hide_tray_when_disconnected {
-            connected
-        } else {
-            true
-        };
-
-        let vis_changed = target_visible != app.tray_visible;
-        if vis_changed {
-            let _ = app.tray.set_visible(target_visible);
-            app.tray_visible = target_visible;
+        let serial = recording_serial();
+        let recording_changed = serial != app.last_recording_serial;
+        if recording_changed {
+            app.last_recording_serial = serial;
         }
 
-        if is_dirty || vis_changed {
-            if app.tray_visible {
-                app.tray.set_title::<&str>(None);
-                if let Ok(icon) = make_icon(&snap) {
-                    let _ = app.tray.set_icon_with_as_template(Some(icon), true);
+        // 0. 消费来自菜单或其他线程的弹窗请求
+        crate::panel::PopoverPanel::poll_open_request();
+
+        // 1. 托盘点击事件：左键弹出/收起 PopoverPanel (只响应 Down 避免双触发)
+        let tray_receiver = TrayIconEvent::receiver();
+        while let Ok(ev) = tray_receiver.try_recv() {
+            if let TrayIconEvent::Click {
+                button,
+                rect,
+                button_state,
+                ..
+            } = ev
+            {
+                if button == MouseButton::Left && button_state == tray_icon::MouseButtonState::Down {
+                    crate::panel::PopoverPanel::toggle_at(Some(rect));
                 }
             }
-            app.refresh_menu(&snap);
         }
-    }
+
+        // 2. 菜单事件 → 转发到工作线程(主线程不执行设备操作)
+        let receiver = MenuEvent::receiver();
+        while let Ok(ev) = receiver.try_recv() {
+            let id = ev.id().0.clone();
+            if id == "panel:open" {
+                crate::panel::PopoverPanel::show_at(None);
+                continue;
+            }
+            if let Some(tx) = ACTION_TX.get() {
+                let _ = tx.send(id);
+            }
+        }
+
+        app.ticks = app.ticks.wrapping_add(1);
+        let periodic_check = app.ticks % 5 == 0; // 每秒检查一次配置变更
+
+        if periodic_check {
+            if let Ok(cfg) = config::load() {
+                app.cfg = cfg;
+            }
+        }
+
+        // 3. 状态变化 → 快照后原地刷新(不持锁渲染)
+        let (snap, is_dirty) = {
+            let mut st = match app.state.try_lock() {
+                Ok(st) => st,
+                Err(_) => return, // 轮询线程正持有锁,下个 0.2s 周期再来
+            };
+            let dirty = st.dirty || recording_changed;
+            if dirty {
+                st.dirty = false;
+                (Some(st.snap.clone()), true)
+            } else if periodic_check {
+                (Some(st.snap.clone()), false)
+            } else {
+                (None, false)
+            }
+        };
+        if let Some(snap) = snap {
+            let connected = is_device_connected(&snap);
+            let target_visible = if app.cfg.hide_tray_when_disconnected {
+                connected
+            } else {
+                true
+            };
+
+            let vis_changed = target_visible != app.tray_visible;
+            if vis_changed {
+                let _ = app.tray.set_visible(target_visible);
+                app.tray_visible = target_visible;
+            }
+
+            if is_dirty || vis_changed {
+                if app.tray_visible {
+                    app.tray.set_title::<&str>(None);
+                    if let Ok(icon) = make_icon(&snap) {
+                        let _ = app.tray.set_icon_with_as_template(Some(icon), true);
+                    }
+                }
+                app.refresh_menu(&snap);
+            }
+        }
+    });
 }

@@ -241,25 +241,27 @@ fn live_led_worker() {
             guard.pending_persist = Some(cmd.clone());
             drop(guard);
 
-            if let Ok(dev) = crate::device::get_conn(1) {
-                let _ = with_device_lock(|| {
-                    if read_mode(&dev)? != OnboardMode::Host {
-                        return Ok(());
-                    }
-                    let led = Led::new(&dev)?;
-                    match cmd.target {
-                        TargetZone::Single(z) => {
-                            apply_led_spec_inner(&dev, &led, z, &cmd.spec)?;
+            objc2::rc::autoreleasepool(|_| {
+                if let Ok(dev) = crate::device::get_conn(1) {
+                    let _ = with_device_lock(|| {
+                        if read_mode(&dev)? != OnboardMode::Host {
+                            return Ok(());
                         }
-                        TargetZone::All => {
-                            apply_led_spec_inner(&dev, &led, led::ZONE_PRIMARY, &cmd.spec)?;
-                            std::thread::sleep(Duration::from_millis(25));
-                            apply_led_spec_inner(&dev, &led, led::ZONE_LOGO, &cmd.spec)?;
+                        let led = Led::new(&dev)?;
+                        match cmd.target {
+                            TargetZone::Single(z) => {
+                                apply_led_spec_inner(&dev, &led, z, &cmd.spec)?;
+                            }
+                            TargetZone::All => {
+                                apply_led_spec_inner(&dev, &led, led::ZONE_PRIMARY, &cmd.spec)?;
+                                std::thread::sleep(Duration::from_millis(25));
+                                apply_led_spec_inner(&dev, &led, led::ZONE_LOGO, &cmd.spec)?;
+                            }
                         }
-                    }
-                    Ok(())
-                });
-            }
+                        Ok(())
+                    });
+                }
+            });
 
             // 下发后做短暂合流保护（30ms），防止高频拖动冲垮固件
             std::thread::sleep(Duration::from_millis(30));
@@ -377,9 +379,11 @@ fn live_dpi_worker() {
             guard.pending_persist = Some(cmd.clone());
             drop(guard);
 
-            if let Ok(dev) = crate::device::get_conn(1) {
-                let _ = set_dpi_confirmed(&dev, cmd.dpi);
-            }
+            objc2::rc::autoreleasepool(|_| {
+                if let Ok(dev) = crate::device::get_conn(1) {
+                    let _ = set_dpi_confirmed(&dev, cmd.dpi);
+                }
+            });
 
             // 下发后做短暂合流保护（30ms），防止高频拖动冲垮固件
             std::thread::sleep(Duration::from_millis(30));

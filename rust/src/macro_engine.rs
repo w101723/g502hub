@@ -1252,32 +1252,38 @@ impl MacroTap {
             .spawn(move || {
                 let mut raw_serial = RAW_EVENT_SERIAL.load(Ordering::Relaxed);
                 loop {
-                    match rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok((key, actions)) => {
-                            mlog(&format!("绑定命中: {key}, 回放 {} 个动作", actions.len()));
-                            if let Err(e) = play(&actions) {
-                                mlog(&format!("回放失败: {key}: {e}"));
-                            } else {
-                                mlog(&format!("回放已发送: {key}"));
+                    let should_break = objc2::rc::autoreleasepool(|_| {
+                        match rx.recv_timeout(Duration::from_millis(100)) {
+                            Ok((key, actions)) => {
+                                mlog(&format!("绑定命中: {key}, 回放 {} 个动作", actions.len()));
+                                if let Err(e) = play(&actions) {
+                                    mlog(&format!("回放失败: {key}: {e}"));
+                                } else {
+                                    mlog(&format!("回放已发送: {key}"));
+                                }
+                            }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                        let current_serial = RAW_EVENT_SERIAL.load(Ordering::Acquire);
+                        if current_serial != raw_serial {
+                            raw_serial = current_serial;
+                            let kind = RAW_EVENT_KIND.load(Ordering::Relaxed);
+                            let value_1 = RAW_EVENT_VALUE_1.load(Ordering::Relaxed);
+                            let value_2 = RAW_EVENT_VALUE_2.load(Ordering::Relaxed);
+                            match kind {
+                                1 => mlog(&format!("原始鼠标事件:button={value_1},down")),
+                                2 => mlog(&format!("原始鼠标事件:button={value_1},up")),
+                                3 => mlog(&format!(
+                                    "原始滚轮事件:vertical={value_1},horizontal={value_2}"
+                                )),
+                                _ => {}
                             }
                         }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                    let current_serial = RAW_EVENT_SERIAL.load(Ordering::Acquire);
-                    if current_serial != raw_serial {
-                        raw_serial = current_serial;
-                        let kind = RAW_EVENT_KIND.load(Ordering::Relaxed);
-                        let value_1 = RAW_EVENT_VALUE_1.load(Ordering::Relaxed);
-                        let value_2 = RAW_EVENT_VALUE_2.load(Ordering::Relaxed);
-                        match kind {
-                            1 => mlog(&format!("原始鼠标事件:button={value_1},down")),
-                            2 => mlog(&format!("原始鼠标事件:button={value_1},up")),
-                            3 => mlog(&format!(
-                                "原始滚轮事件:vertical={value_1},horizontal={value_2}"
-                            )),
-                            _ => {}
-                        }
+                        false
+                    });
+                    if should_break {
+                        break;
                     }
                 }
             })?;
@@ -1481,11 +1487,13 @@ unsafe extern "C" fn tap_callback(
     event: CGEventRef,
     user_info: *mut c_void,
 ) -> CGEventRef {
-    let result = std::panic::catch_unwind(|| tap_callback_inner(proxy, etype, event, user_info));
-    match result {
-        Ok(ret) => ret,
-        Err(_) => event, // 防止跨越 FFI 边界 unwind
-    }
+    objc2::rc::autoreleasepool(|_| {
+        let result = std::panic::catch_unwind(|| tap_callback_inner(proxy, etype, event, user_info));
+        match result {
+            Ok(ret) => ret,
+            Err(_) => event, // 防止跨越 FFI 边界 unwind
+        }
+    })
 }
 
 #[inline(always)]

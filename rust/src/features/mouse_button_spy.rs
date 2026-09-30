@@ -110,43 +110,52 @@ fn listen(dev: HidDevice, stop: Arc<AtomicBool>, dev_index: u8, feature_index: u
     let mut previous = 0u16;
     let mut failures = 0u8;
     while !stop.load(Ordering::Acquire) {
-        let mut buf = [0u8; LONG_LEN];
-        match dev.read_timeout(&mut buf, 200) {
-            Ok(0) => {}
-            Ok(n) => {
-                failures = 0;
-                let Some(current) = parse_button_bitmap(&buf[..n], dev_index, feature_index) else {
-                    continue;
-                };
-                if current == previous {
-                    continue;
-                }
-                crate::macro_engine::mlog(&format!(
-                    "MouseButtonSpy 报告: previous={previous:#06x},current={current:#06x}"
-                ));
-                for (button, is_down) in changed_buttons(previous, current, count) {
-                    crate::macro_engine::mlog(&format!(
-                        "MouseButtonSpy 槽位: G{},mouse{},{}",
-                        button + 1,
-                        button,
-                        if is_down { "down" } else { "up" }
-                    ));
-                    if crate::macro_engine::get_gkey_by_button(button).is_some() {
-                        let _ = crate::macro_engine::handle_device_button(button, is_down);
+        let should_sleep = objc2::rc::autoreleasepool(|_| {
+            let mut buf = [0u8; LONG_LEN];
+            match dev.read_timeout(&mut buf, 200) {
+                Ok(0) => false,
+                Ok(n) => {
+                    failures = 0;
+                    let Some(current) = parse_button_bitmap(&buf[..n], dev_index, feature_index) else {
+                        return false;
+                    };
+                    if current == previous {
+                        return false;
                     }
+                    crate::macro_engine::mlog(&format!(
+                        "MouseButtonSpy 报告: previous={previous:#06x},current={current:#06x}"
+                    ));
+                    for (button, is_down) in changed_buttons(previous, current, count) {
+                        crate::macro_engine::mlog(&format!(
+                            "MouseButtonSpy 槽位: G{},mouse{},{}",
+                            button + 1,
+                            button,
+                            if is_down { "down" } else { "up" }
+                        ));
+                        if crate::macro_engine::get_gkey_by_button(button).is_some() {
+                            let _ = crate::macro_engine::handle_device_button(button, is_down);
+                        }
+                    }
+                    previous = current;
+                    false
                 }
-                previous = current;
-            }
-            Err(error) => {
-                failures = failures.saturating_add(1);
-                crate::macro_engine::mlog(&format!(
-                    "MouseButtonSpy 读取失败 ({failures}/3): {error}"
-                ));
-                if failures >= 3 {
-                    break;
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    crate::macro_engine::mlog(&format!(
+                        "MouseButtonSpy 读取失败 ({failures}/3): {error}"
+                    ));
+                    if failures >= 3 {
+                        return false;
+                    }
+                    true
                 }
-                std::thread::sleep(Duration::from_millis(100));
             }
+        });
+        if failures >= 3 {
+            break;
+        }
+        if should_sleep {
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
     crate::macro_engine::mlog("MouseButtonSpy 监听线程退出");
