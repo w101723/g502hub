@@ -122,17 +122,21 @@ fn listen(dev: HidDevice, stop: Arc<AtomicBool>, dev_index: u8, feature_index: u
                     if current == previous {
                         return false;
                     }
-                    crate::macro_engine::mlog(&format!(
-                        "MouseButtonSpy 报告: previous={previous:#06x},current={current:#06x}"
-                    ));
+                    let is_recording = !matches!(
+                        crate::macro_engine::recording_phase(),
+                        crate::macro_engine::RecordingPhase::Idle
+                    );
                     for (button, is_down) in changed_buttons(previous, current, count) {
-                        crate::macro_engine::mlog(&format!(
-                            "MouseButtonSpy 槽位: G{},mouse{},{}",
-                            button + 1,
-                            button,
-                            if is_down { "down" } else { "up" }
-                        ));
-                        if crate::macro_engine::get_gkey_by_button(button).is_some() {
+                        let is_gkey = crate::macro_engine::get_gkey_by_button(button).is_some();
+                        if is_gkey || is_recording {
+                            crate::macro_engine::mlog(&format!(
+                                "MouseButtonSpy 槽位: G{},mouse{},{}",
+                                button + 1,
+                                button,
+                                if is_down { "down" } else { "up" }
+                            ));
+                        }
+                        if is_gkey {
                             let _ = crate::macro_engine::handle_device_button(button, is_down);
                         }
                     }

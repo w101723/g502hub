@@ -622,14 +622,24 @@ pub fn play(actions: &[Action]) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------- //
-// 宏链路日志(仅供启动/停止/回放线程外轻量记录，tap 回调内禁用)
+// 宏链路日志(单文件 5MB 轮转限制，仅供启动/停止/回放线程外轻量记录，tap 回调内禁用)
 // ---------------------------------------------------------------------- //
+const MAX_LOG_SIZE_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
+
 pub fn mlog(msg: &str) {
     use std::io::Write;
+    let log_path = std::path::Path::new("/tmp/g502hub_macro.log");
+    // 日志轮转：超过 5MB 自动归档至 .old 并重新建文件，防止无限占用磁盘
+    if let Ok(meta) = std::fs::metadata(log_path) {
+        if meta.len() >= MAX_LOG_SIZE_BYTES {
+            let backup_path = std::path::Path::new("/tmp/g502hub_macro.log.old");
+            let _ = std::fs::rename(log_path, backup_path);
+        }
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/g502hub_macro.log")
+        .open(log_path)
     {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1271,12 +1281,19 @@ impl MacroTap {
                             let kind = RAW_EVENT_KIND.load(Ordering::Relaxed);
                             let value_1 = RAW_EVENT_VALUE_1.load(Ordering::Relaxed);
                             let value_2 = RAW_EVENT_VALUE_2.load(Ordering::Relaxed);
+                            let is_recording = !matches!(recording_phase(), RecordingPhase::Idle);
                             match kind {
-                                1 => mlog(&format!("原始鼠标事件:button={value_1},down")),
-                                2 => mlog(&format!("原始鼠标事件:button={value_1},up")),
-                                3 => mlog(&format!(
-                                    "原始滚轮事件:vertical={value_1},horizontal={value_2}"
-                                )),
+                                1 if is_recording || value_1 >= 3 => {
+                                    mlog(&format!("原始鼠标事件:button={value_1},down"));
+                                }
+                                2 if is_recording || value_1 >= 3 => {
+                                    mlog(&format!("原始鼠标事件:button={value_1},up"));
+                                }
+                                3 if is_recording || value_2 != 0 => {
+                                    mlog(&format!(
+                                        "原始滚轮事件:vertical={value_1},horizontal={value_2}"
+                                    ));
+                                }
                                 _ => {}
                             }
                         }

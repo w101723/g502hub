@@ -1128,6 +1128,7 @@ fn poll_loop(state: Arc<Mutex<State>>, led_sync_pending: Arc<AtomicBool>) {
     let mut battery_failures = 0u8;
     let mut state_sync_pending = false;
     let mut last_iteration = Instant::now();
+    let mut last_connect_error: Option<String> = None;
     loop {
         let (next_delay, should_invalidate) = objc2::rc::autoreleasepool(|_| {
             if last_iteration.elapsed() >= SYSTEM_WAKE_GAP {
@@ -1217,6 +1218,7 @@ fn poll_loop(state: Arc<Mutex<State>>, led_sync_pending: Arc<AtomicBool>) {
                     Ok((dev, device_desc, battery, applied, led_synced))
                 }) {
                     Ok((dev, device_desc, battery, applied, led_synced)) => {
+                        last_connect_error = None;
                         delay = if applied.is_some() { 5 } else { 2 };
                         desc = device_desc;
                         state_sync_pending = applied.is_none();
@@ -1229,9 +1231,13 @@ fn poll_loop(state: Arc<Mutex<State>>, led_sync_pending: Arc<AtomicBool>) {
                         active = Some(dev);
                     }
                     Err(e) => {
-                        eprintln!("设备连接失败，将重试: {e}");
+                        let err_msg = e.to_string();
+                        if last_connect_error.as_deref() != Some(&err_msg) {
+                            eprintln!("设备连接失败，将重试: {err_msg}");
+                            last_connect_error = Some(err_msg.clone());
+                        }
                         delay = 2;
-                        publish_offline(&state, e.to_string());
+                        publish_offline(&state, err_msg);
                     }
                 }
             }
