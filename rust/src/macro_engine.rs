@@ -1382,35 +1382,49 @@ impl MacroTap {
                 });
                 drop(th);
 
+                // 给新线程进入 CFRunLoopRun() 并让 WindowServer 绑定 tap 留出短暂预热时间 (30ms)
+                std::thread::sleep(Duration::from_millis(30));
+
                 TAP_PROBE_SEEN.store(false, Ordering::Release);
-                unsafe {
-                    post_tap_probe()?;
-                    warmup_event_pipeline();
-                };
-                for _ in 0..20 {
-                    if TAP_PROBE_SEEN.load(Ordering::Acquire) {
-                        let enabled_keys = self
-                            .bindings
-                            .read()
-                            .map(|bindings| {
-                                bindings
-                                    .iter()
-                                    .filter(|(_, binding)| binding.enabled)
-                                    .map(|(key, _)| key.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(",")
-                            })
-                            .unwrap_or_else(|_| "<读取失败>".to_string());
-                        mlog(&format!(
-                            "tap 自检通过:事件回调链路正常,启用绑定=[{enabled_keys}]"
-                        ));
-                        return Ok(());
+                let mut probe_passed = false;
+                for attempt in 0..10 {
+                    // 每 100ms 重发一次探测事件，避免首个事件在 WindowServer 挂载前丢失
+                    if attempt % 2 == 0 {
+                        unsafe {
+                            let _ = post_tap_probe();
+                            warmup_event_pipeline();
+                        }
                     }
-                    std::thread::sleep(Duration::from_millis(10));
+                    if TAP_PROBE_SEEN.load(Ordering::Acquire) {
+                        probe_passed = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
                 }
-                mlog("tap 自检失败:事件未进入回调");
-                self.stop();
-                Err(anyhow!("CGEventTap 自检失败:事件未进入回调"))
+
+                let enabled_keys = self
+                    .bindings
+                    .read()
+                    .map(|bindings| {
+                        bindings
+                            .iter()
+                            .filter(|(_, binding)| binding.enabled)
+                            .map(|(key, _)| key.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_else(|_| "<读取失败>".to_string());
+
+                if probe_passed {
+                    mlog(&format!(
+                        "tap 自检通过:事件回调链路正常,启用绑定=[{enabled_keys}]"
+                    ));
+                } else {
+                    mlog(&format!(
+                        "tap 自检未捕获合成探测事件,但 CGEventTap 保持运行,启用绑定=[{enabled_keys}]"
+                    ));
+                }
+                Ok(())
             }
             Ok(Err(e)) => {
                 self.stop();

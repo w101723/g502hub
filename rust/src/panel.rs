@@ -1107,7 +1107,10 @@ declare_class!(
         #[method(onToggleMacroEngine:)]
         fn on_toggle_macro_engine(&self, _sender: Option<&NSSwitch>) {
             crate::menubar::dispatch_menu_action("macro:toggle");
-            PopoverPanel::sync_macro_ui();
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                PopoverPanel::sync_macro_ui();
+            });
         }
 
         #[method(onTextInputEnded:)]

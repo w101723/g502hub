@@ -150,6 +150,9 @@ pub struct Config {
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     pub macros: BTreeMap<String, MacroBinding>,
+    /// 宏引擎全局开关（默认 true，跟随用户在界面/菜单中的启停持久化记忆）
+    #[serde(default = "default_true")]
+    pub macro_engine_enabled: bool,
     /// 分区灯效配置:键 primary(主要) / logo(标志)。
     #[serde(default)]
     pub led_zones: BTreeMap<String, LedSpec>,
@@ -247,6 +250,7 @@ impl Default for Config {
             dpi_levels: default_dpi_levels(),
             profiles,
             macros,
+            macro_engine_enabled: true,
             led_zones,
             battery_poll_seconds: default_poll(),
             low_battery_threshold: default_threshold(),
@@ -580,5 +584,19 @@ mod tests {
         let deserialized: Config = serde_json::from_str(&serialized).unwrap();
         assert_eq!(deserialized.desired_mode, DesiredMode::Onboard);
         assert_eq!(deserialized.desired_dpi, Some(2400));
+        assert!(deserialized.macro_engine_enabled);
+    }
+
+    #[test]
+    fn test_macro_engine_enabled_default_and_persistence() {
+        // 遗留 JSON 未显式包含 macro_engine_enabled，反序列化应默认 true
+        let legacy_json = r#"{"macros": {}}"#;
+        let cfg: Config = serde_json::from_str(legacy_json).unwrap();
+        assert!(cfg.macro_engine_enabled);
+
+        // 显式为 false 时能够正确保持
+        let disabled_json = r#"{"macro_engine_enabled": false}"#;
+        let disabled_cfg: Config = serde_json::from_str(disabled_json).unwrap();
+        assert!(!disabled_cfg.macro_engine_enabled);
     }
 }

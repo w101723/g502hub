@@ -885,9 +885,12 @@ impl Core {
                 }
             }
             ("macro", "toggle") => {
-                crate::macro_engine::mlog("菜单点击:切换宏引擎");
+                crate::macro_engine::mlog("菜单/面板操作:切换宏引擎");
                 if self.tap.is_running() {
                     self.tap.stop();
+                    let _ = config::update(|cfg| {
+                        cfg.macro_engine_enabled = false;
+                    });
                     self.notify("宏引擎已停用(侧键恢复默认)");
                 } else {
                     if !accessibility_granted(false) {
@@ -898,6 +901,9 @@ impl Core {
                     if let Err(e) = self.tap.start() {
                         self.notify(&format!("宏引擎启动失败: {e}"));
                     } else {
+                        let _ = config::update(|cfg| {
+                            cfg.macro_engine_enabled = true;
+                        });
                         self.notify("宏引擎已启用:按绑定的侧键试试");
                     }
                 }
@@ -905,6 +911,7 @@ impl Core {
                 if let Ok(mut st) = self.state.lock() {
                     st.dirty = true;
                 }
+                crate::panel::PopoverPanel::sync_macro_ui();
             }
             ("ghub", "quit") => {
                 let _ = std::process::Command::new("osascript")
@@ -1298,12 +1305,13 @@ pub fn run() -> Result<()> {
     })));
     crate::macro_engine::set_global_tap(tap.clone());
 
-    if cfg.macros.values().any(|m| m.enabled) {
+    let should_start_macros = cfg.macro_engine_enabled && cfg.macros.values().any(|m| m.enabled);
+    if should_start_macros {
         let granted = accessibility_granted(false);
         let input_granted = input_monitoring_granted(false);
         let posting_granted = event_posting_granted();
         crate::macro_engine::mlog(&format!(
-            "menubar 启动:有启用宏,accessibility={granted},input_monitoring={input_granted},event_posting={posting_granted}"
+            "menubar 启动:宏引擎开启中,accessibility={granted},input_monitoring={input_granted},event_posting={posting_granted}"
         ));
         if granted {
             if !input_granted {
@@ -1311,7 +1319,26 @@ pub fn run() -> Result<()> {
                 crate::macro_engine::mlog("menubar 启动:已请求输入监控权限");
             }
             if let Err(e) = tap.start() {
-                crate::macro_engine::mlog(&format!("menubar 启动:tap 启动失败: {e}"));
+                crate::macro_engine::mlog(&format!("menubar 启动:tap 启动失败: {e}, 启动后台自愈重试"));
+                let tap_retry = tap.clone();
+                std::thread::spawn(move || {
+                    for attempt in 1..=5 {
+                        std::thread::sleep(Duration::from_millis(500 * attempt));
+                        if tap_retry.is_running() {
+                            break;
+                        }
+                        crate::macro_engine::mlog(&format!("tap 自愈重试 ({attempt}/5)..."));
+                        match tap_retry.start() {
+                            Ok(()) => {
+                                crate::macro_engine::mlog("tap 自愈启动成功");
+                                break;
+                            }
+                            Err(err) => {
+                                crate::macro_engine::mlog(&format!("tap 自愈重试失败: {err}"));
+                            }
+                        }
+                    }
+                });
             }
         } else {
             // 以最终签名 Bundle 的身份触发系统授权引导；旧的裸二进制/zcode 授权不再复用。
@@ -1334,6 +1361,8 @@ pub fn run() -> Result<()> {
                 }
             });
         }
+    } else if !cfg.macro_engine_enabled {
+        crate::macro_engine::mlog("menubar 启动:用户配置宏引擎已停用,tap 未启动");
     } else {
         crate::macro_engine::mlog("menubar 启动:无启用宏,tap 未启动");
     }
